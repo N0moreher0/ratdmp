@@ -1,0 +1,26 @@
+[package]
+name = "ratdmp"
+version = "0.3.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Fast streaming ASCII/UTF-16LE string extractor for raw memory dump (.dmp) files, with simple noise filtering for byte-fill/heap-fill patterns. Never loads the whole file into RAM."
+readme = "README.md"
+repository = "https://github.com/N0moreher0/ratdmp"
+keywords = ["strings", "forensics", "memory-dump", "malware", "dfir"]
+categories = ["parsing", "command-line-utilities"]
+rust-version = "1.70"
+
+[dependencies]
+# Exactly one external dependency -- so `ExtractedString` can be serialized
+# (derive Serialize). serde_json is NOT pulled in: wrapping results in
+# JSON/a specific protocol (if needed) is the caller's job, not this
+# library's (keeping the lib "pure algorithm", with no knowledge of
+# JSON-lines IPC).
+serde = { version = "1", features = ["derive"] }
+
+# CLI: a separate binary, with hand-rolled arg parsing and hand-rolled
+# JSON output -- NO extra dependencies added (no clap, no serde_json),
+# keeping this crate's "exactly one dependency" philosophy.
+[[bin]]
+name = "ratdmp"
+path = "src/bin/ratdmp.rs"
