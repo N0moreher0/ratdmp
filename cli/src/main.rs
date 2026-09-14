@@ -167,6 +167,10 @@ fn important_reason(text: &str) -> Option<&'static str> {
     .any(|term| lower.contains(term))
     {
         Some("credential")
+    } else if contains_ip_address(text) {
+        Some("ip-address")
+    } else if contains_crypto_address(text) {
+        Some("crypto-wallet")
     } else if lower.contains("http://") || lower.contains("https://") {
         Some("url")
     } else if lower.contains("c2") || lower.contains("gate.php") {
@@ -175,6 +179,103 @@ fn important_reason(text: &str) -> Option<&'static str> {
         Some("email")
     } else {
         None
+    }
+}
+
+fn contains_ip_address(text: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != ':')
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            token
+                .split_once(':')
+                .map(|(host, _port)| host.parse::<std::net::Ipv4Addr>().is_ok())
+                .unwrap_or(false)
+                || token.parse::<std::net::Ipv4Addr>().is_ok()
+                || token.parse::<std::net::Ipv6Addr>().is_ok()
+        })
+}
+
+fn contains_crypto_address(text: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .any(is_crypto_address)
+}
+
+fn is_crypto_address(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+
+    // Ethereum and EVM-compatible addresses.
+    if token.len() == 42
+        && lower.starts_with("0x")
+        && token[2..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return true;
+    }
+
+    // Bitcoin legacy (1/3...), native SegWit (bc1...), and testnet (tb1...).
+    if (token.starts_with('1') || token.starts_with('3'))
+        && (26..=35).contains(&token.len())
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() && !matches!(b, b'0' | b'O' | b'I' | b'l'))
+    {
+        return true;
+    }
+    if (lower.starts_with("bc1") || lower.starts_with("tb1"))
+        && token.len() >= 14
+        && token[3..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b.is_ascii_alphanumeric()))
+    {
+        return true;
+    }
+
+    // Monero primary addresses are 95-character Base58 strings beginning 4.
+    if token.starts_with('4')
+        && token.len() == 95
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() && !matches!(b, b'0' | b'O' | b'I' | b'l'))
+    {
+        return true;
+    }
+
+    // Solana addresses are typically 32-44 characters of Base58.
+    token.len() >= 32
+        && token.len() <= 44
+        && token.bytes().any(|b| b.is_ascii_digit())
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() && !matches!(b, b'0' | b'O' | b'I' | b'l'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{contains_crypto_address, contains_ip_address, important_reason};
+
+    #[test]
+    fn highlights_ipv4_and_ipv6() {
+        assert!(contains_ip_address("connect 192.168.56.101:4444"));
+        assert!(contains_ip_address("fe80::1"));
+    }
+
+    #[test]
+    fn highlights_common_wallet_formats() {
+        assert!(contains_crypto_address(
+            "0x52908400098527886E0F7030069857D2E4169EE7"
+        ));
+        assert!(contains_crypto_address(
+            "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"
+        ));
+    }
+
+    #[test]
+    fn prioritizes_ip_and_wallet_signals() {
+        assert_eq!(important_reason("server=10.0.0.8"), Some("ip-address"));
+        assert_eq!(
+            important_reason("wallet=0x52908400098527886E0F7030069857D2E4169EE7"),
+            Some("crypto-wallet")
+        );
     }
 }
 

@@ -27,7 +27,8 @@ This repository contains two layers:
   results.
 - **`ratdmp-cli`** — the optional command-line frontend in [`cli/`](./cli/),
   published separately with a RATDMP banner, automatic reports, JSON/text
-  output, encoding filters, triage signals, and hardware-aware scanning.
+  output, encoding filters, credential/IP/crypto-wallet triage signals, and
+  hardware-aware scanning.
 
 Use the Rust API directly for custom applications, or install the finished
 CLI when you want an immediate command-line workflow.
@@ -205,6 +206,7 @@ The CLI adds:
 - `--threads` and `--auto-tune`
 - `-o/--output`
 - automatic scan reports and priority triage signals on `stderr`
+- IPv4/IPv6 and common crypto-wallet address hints
 
 Results stay clean on `stdout`, so the CLI works both interactively and in
 shell pipelines. The priority signals are practical investigation hints for
