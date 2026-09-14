@@ -84,25 +84,39 @@ array of `{"offset":...,"encoding":...,"text":...}`.
 
 ### Terminal UI and automatic report
 
-When running interactively, ratdmp shows a compact banner before scanning and
-prints a report after every scan. The report is always written to `stderr`, so
-stdout remains clean for pipes, redirected text, and JSON parsers:
+When running interactively, ratdmp shows a structured banner, scan status, and
+summary panel inspired by modern open-source CLI tools. The report is always
+written to `stderr`, so stdout remains clean for pipes, redirected text, and
+JSON parsers:
 
 ```text
---- scan report ---
-results       : 15 (short: 3, medium: 5, long: 7)
-threads       : 1
-file size     : 5.42 KiB
-time          : 9.820 ms
-throughput    : 551.45 KiB/s
-peak RSS      : 35.77 MiB
++------------------------------------------------------------+
+| ratdmp v0.4.0 | memory-dump string triage                 |
++------------------------------------------------------------+
+  input  sample_demo.dmp  |  5.42 KiB  |  text
+  [..] scanning
+  [OK] scan complete
++-------------------- summary -----------------------------+
+  results      : 15
+  length       : 2 short | 4 medium | 9 long
+  threads      : 1
+  file size    : 5.42 KiB
+  elapsed      : 26.235 ms
+  throughput   : 206.41 KiB/s
+  peak memory  : 36.35 MiB
++------------------------------------------------------------+
+  [!] priority findings (up to 12)
+      credential 0x00000624 ascii   discord_token=...
+      email      0x00000724 ascii   analyst@example.test
 ```
 
 Results are grouped by text length (`short` 4-7, `medium` 8-31, `long` 32+).
 Likely high-value strings such as credentials, tokens, secrets, URLs, network
 indicators, and email addresses are listed separately and highlighted with
 ANSI color when stderr is a terminal. Color is disabled automatically when
-output is redirected.
+output is redirected. The UI never writes ANSI escape sequences to redirected
+output and never contaminates stdout, making it suitable for shell pipelines
+and automation.
 
 **`--noise-threshold <N>`** — configures the byte-fill/heap-fill noise
 filter instead of the hardcoded defaults (period-1 repeats like `aaaa`

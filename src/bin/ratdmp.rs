@@ -488,17 +488,23 @@ fn print_intro(path: &str, file_size: u64, format: Format) {
     if !io::stderr().is_terminal() {
         return;
     }
-    eprintln!("\x1b[1;36m ratdmp \x1b[0m \x1b[2mfast memory-dump string triage\x1b[0m");
+    let format_name = match format {
+        Format::Text => "text",
+        Format::Json => "json",
+    };
+    eprintln!("\x1b[1;36m+------------------------------------------------------------+\x1b[0m");
     eprintln!(
-        "\x1b[2m scanning \x1b[0m{}\x1b[2m ({}, {})\x1b[0m",
+        "\x1b[1;36m| \x1b[1;37mratdmp v{:<5}\x1b[0m \x1b[2m| memory-dump string triage\x1b[1;36m             |\x1b[0m",
+        env!("CARGO_PKG_VERSION")
+    );
+    eprintln!("\x1b[1;36m+------------------------------------------------------------+\x1b[0m");
+    eprintln!(
+        "\x1b[2m  input  \x1b[0m{}\x1b[2m  |  {}  |  {}\x1b[0m",
         path,
         human_bytes(file_size),
-        match format {
-            Format::Text => "text",
-            Format::Json => "json",
-        }
+        format_name
     );
-    eprintln!();
+    eprintln!("\x1b[1;34m  [..] scanning\x1b[0m");
 }
 
 fn print_report(
@@ -530,41 +536,45 @@ fn print_report(
         f64::INFINITY
     };
     if color {
-        eprintln!("\x1b[1;35m--- scan report ---\x1b[0m");
+        eprintln!("\x1b[1;32m  [OK] scan complete\x1b[0m");
+        eprintln!("\x1b[1;36m+-------------------- summary -----------------------------+\x1b[0m");
     } else {
-        eprintln!("--- scan report ---");
+        eprintln!("  [OK] scan complete");
+        eprintln!("+-------------------- summary -----------------------------+");
     }
-    eprintln!(
-        "results       : {} (short: {}, medium: {}, long: {})",
-        strings.len(),
-        short,
-        medium,
-        long
-    );
-    eprintln!("threads       : {threads}");
-    eprintln!("file size     : {}", human_bytes(file_size));
-    eprintln!("time          : {:.3} ms", elapsed.as_secs_f64() * 1000.0);
-    eprintln!("throughput    : {}/s", human_bytes(throughput as u64));
+    eprintln!("  results      : {}", strings.len());
+    eprintln!("  length       : {short} short | {medium} medium | {long} long");
+    eprintln!("  threads      : {threads}");
+    eprintln!("  file size    : {}", human_bytes(file_size));
+    eprintln!("  elapsed      : {:.3} ms", elapsed.as_secs_f64() * 1000.0);
+    eprintln!("  throughput   : {}/s", human_bytes(throughput as u64));
     match mem_stats::peak_rss_bytes() {
-        Some(bytes) => eprintln!("peak RSS      : {}", human_bytes(bytes)),
-        None => eprintln!("peak RSS      : n/a (not supported on this OS)"),
+        Some(bytes) => eprintln!("  peak memory  : {}", human_bytes(bytes)),
+        None => eprintln!("  peak memory  : n/a"),
+    }
+    if color {
+        eprintln!(
+            "\x1b[1;36m+------------------------------------------------------------+\x1b[0m"
+        );
+    } else {
+        eprintln!("+------------------------------------------------------------+");
     }
     if !important.is_empty() {
         if color {
-            eprintln!("\x1b[1;33mimportant findings (up to 12):\x1b[0m");
+            eprintln!("\x1b[1;33m  [!] priority findings (up to 12)\x1b[0m");
         } else {
-            eprintln!("important findings (up to 12):");
+            eprintln!("  [!] priority findings (up to 12)");
         }
         for string in important {
             let reason = importance_reason(&string.text).unwrap_or("interesting");
             if color {
                 eprintln!(
-                    "  \x1b[1;31m[{reason}]\x1b[0m {:#010x} {} {}",
+                    "      \x1b[1;31m{reason:<10}\x1b[0m {:#010x} {:<7} {}",
                     string.offset, string.encoding, string.text
                 );
             } else {
                 eprintln!(
-                    "  [{reason}] {:#010x} {} {}",
+                    "      {reason:<10} {:#010x} {:<7} {}",
                     string.offset, string.encoding, string.text
                 );
             }
