@@ -46,6 +46,7 @@ Then scan immediately:
 
 ```powershell
 ratdmp memory.dmp --auto-tune
+ratdmp memory.dmp --entropy --format json -o triage.json
 ```
 
 Update an existing installation:
@@ -212,6 +213,7 @@ The CLI adds:
 - `--min-len` and `--max-strings`
 - `--noise-threshold`
 - `--threads` and `--auto-tune`
+- `--entropy` to export high-entropy memory regions
 - `-o/--output`
 - automatic scan reports and priority triage signals on `stderr`
 - IPv4/IPv6 and common crypto-wallet address hints
@@ -220,6 +222,12 @@ Results stay clean on `stdout`, so the CLI works both interactively and in
 shell pipelines. The priority signals are practical investigation hints for
 common credential, token, secret, URL, network, and email patterns; they are
 not a verdict that a value is valid, active, or malicious.
+
+Entropy scanning is opt-in so the default scan keeps its original throughput.
+When enabled, fixed-size high-entropy regions are exported as `Undefined`
+records in both text and JSON output. Each record includes its offset, length,
+measured entropy, and original bytes encoded as hexadecimal; ratdmp does not
+decrypt or identify the underlying compression/encryption format.
 
 ## Streaming and parallel scanning
 
