@@ -193,6 +193,21 @@ fn write_entropy_json(
     Ok(())
 }
 
+fn write_entropy_text(
+    region: EntropyRegion,
+    data: &[u8],
+    writer: &mut dyn Write,
+) -> io::Result<()> {
+    writeln!(
+        writer,
+        "{:#010x}\tUndefined\tlength={}\tentropy={:.6}\tdata_hex={}",
+        region.offset,
+        region.length,
+        region.entropy,
+        hex_encode(data)
+    )
+}
+
 fn write_string_json(
     result: &ExtractedString,
     writer: &mut dyn Write,
@@ -573,6 +588,22 @@ fn main() -> Result<(), String> {
                 return Err(format!("write failed: {error}"));
             }
             write!(writer, "\n]\n").map_err(|e| format!("write failed: {e}"))?;
+        } else {
+            scan_entropy_from_file_streaming_with_data(
+                &args.path,
+                ENTROPY_THRESHOLD,
+                |region, data| {
+                    if write_error.is_none() {
+                        if let Err(error) = write_entropy_text(region, data, &mut writer) {
+                            write_error = Some(error);
+                        }
+                    }
+                },
+            )
+            .map_err(|e| format!("entropy scan failed: {e}"))?;
+            if let Some(error) = write_error {
+                return Err(format!("write failed: {error}"));
+            }
         }
         writer.flush().map_err(|e| format!("write failed: {e}"))?;
         if let Some(path) = args.output {
@@ -647,6 +678,24 @@ fn main() -> Result<(), String> {
     } else {
         write_results(&results, args.format, &mut writer)
             .map_err(|e| format!("write failed: {e}"))?;
+        if args.format == Format::Text {
+            let mut entropy_write_error = None;
+            scan_entropy_from_file_streaming_with_data(
+                &args.path,
+                ENTROPY_THRESHOLD,
+                |region, data| {
+                    if entropy_write_error.is_none() {
+                        if let Err(error) = write_entropy_text(region, data, &mut writer) {
+                            entropy_write_error = Some(error);
+                        }
+                    }
+                },
+            )
+            .map_err(|e| format!("entropy scan failed: {e}"))?;
+            if let Some(error) = entropy_write_error {
+                return Err(format!("write failed: {error}"));
+            }
+        }
     }
     writer.flush().map_err(|e| format!("write failed: {e}"))?;
     if let Some(path) = output_path {

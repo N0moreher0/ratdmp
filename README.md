@@ -75,6 +75,7 @@ padding bytes. `ratdmp` gives applications a predictable core:
   attempted.
 - In CLI JSON output, matching regions are emitted as `group: "Undefined"`
   records with `offset`, `length`, `entropy`, and `data_hex`.
+- Text output emits the same `Undefined` records in tab-separated form.
 - **Configurable behavior**: control minimum length, result limits, and noise
   thresholds from Rust.
 - **Parallel when useful**: opt into bounded region-based scanning with Rayon.
