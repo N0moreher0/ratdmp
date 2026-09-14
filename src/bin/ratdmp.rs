@@ -240,17 +240,13 @@ mod auto_tune {
         None
     }
 
-    /// Tune parallelism conservatively, leaving CPU and memory for the rest
-    /// of the machine. This is a cap, not a promise about disk contention or
-    /// thermal throttling.
-    pub fn choose_threads(file_size: u64, requested: usize) -> usize {
-        if requested != 1 {
-            return requested;
-        }
-
-        let logical_cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
+    /// Calculates a conservative worker count from a hardware snapshot.
+    /// Keeping this pure makes the scaling policy easy to test.
+    fn choose_threads_for_hardware(
+        file_size: u64,
+        logical_cpus: usize,
+        available_memory: Option<u64>,
+    ) -> usize {
         let chunks = ((file_size + REGION_BYTES - 1) / REGION_BYTES) as usize;
         if chunks <= 1 {
             return 1;
@@ -267,14 +263,58 @@ mod auto_tune {
         // Reserve at least 75% of currently available RAM for other
         // processes. Each parallel region is 64 MiB and has scanner/result
         // overhead, so budget 128 MiB per worker.
-        let memory_limit = available_memory_bytes()
+        let memory_limit = available_memory
             .map(|bytes| std::cmp::max(1, ((bytes / 4) / MEMORY_PER_WORKER) as usize))
-            .unwrap_or(1);
+            // On unsupported OSes, still scale with CPU while retaining the
+            // CPU safety cap; the parallel scanner's buffers are bounded.
+            .unwrap_or(cpu_limit);
 
         std::cmp::max(
             1,
             std::cmp::min(chunks, std::cmp::min(cpu_limit, memory_limit)),
         )
+    }
+
+    /// Tune parallelism conservatively, leaving CPU and memory for the rest
+    /// of the machine. This is a cap, not a promise about disk contention or
+    /// thermal throttling.
+    pub fn choose_threads(file_size: u64, requested: usize) -> usize {
+        if requested != 1 {
+            return requested;
+        }
+
+        let logical_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        choose_threads_for_hardware(file_size, logical_cpus, available_memory_bytes())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::choose_threads_for_hardware;
+
+        #[test]
+        fn small_files_stay_single_threaded() {
+            assert_eq!(
+                choose_threads_for_hardware(64 * 1024 * 1024, 32, Some(64 << 30)),
+                1
+            );
+        }
+
+        #[test]
+        fn stronger_hardware_gets_more_workers() {
+            let file_size = 64 * 1024 * 1024 * 32;
+            let modest = choose_threads_for_hardware(file_size, 4, Some(2 << 30));
+            let powerful = choose_threads_for_hardware(file_size, 32, Some(64 << 30));
+            assert!(powerful > modest);
+            assert!(powerful <= 24);
+        }
+
+        #[test]
+        fn low_memory_caps_workers() {
+            let workers = choose_threads_for_hardware(64 * 1024 * 1024 * 32, 32, Some(512 << 20));
+            assert_eq!(workers, 1);
+        }
     }
 }
 
