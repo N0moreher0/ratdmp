@@ -157,7 +157,7 @@ OPTIONS:
                           peak memory, works on files of any size). >1 =
                           parallel scan, faster on multi-core machines with
                           fast storage / a warm page cache.
-    --auto-tune            Choose a safe, high-throughput thread count from
+    --auto-tune            Choose a resource-conservative thread count from
                           CPU count, available memory, and input size. Explicit
                           --threads still takes precedence.
     -h, --help            Print this help
@@ -179,6 +179,9 @@ EXAMPLES:
 ";
 
 mod auto_tune {
+    const REGION_BYTES: u64 = 64 * 1024 * 1024;
+    const MEMORY_PER_WORKER: u64 = 128 * 1024 * 1024;
+
     /// Returns available memory in bytes when the operating system exposes it
     /// without requiring another dependency.
     pub fn available_memory_bytes() -> Option<u64> {
@@ -237,8 +240,9 @@ mod auto_tune {
         None
     }
 
-    /// Tune parallelism only. Extraction thresholds and output settings are
-    /// intentionally unchanged so auto-tuning cannot silently lose evidence.
+    /// Tune parallelism conservatively, leaving CPU and memory for the rest
+    /// of the machine. This is a cap, not a promise about disk contention or
+    /// thermal throttling.
     pub fn choose_threads(file_size: u64, requested: usize) -> usize {
         if requested != 1 {
             return requested;
@@ -247,15 +251,30 @@ mod auto_tune {
         let logical_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        let chunks = ((file_size + (64 * 1024 * 1024) - 1) / (64 * 1024 * 1024)) as usize;
+        let chunks = ((file_size + REGION_BYTES - 1) / REGION_BYTES) as usize;
         if chunks <= 1 {
             return 1;
         }
 
+        // Keep one logical CPU available, and use no more than roughly 75%
+        // of the logical CPUs. Integer arithmetic rounds down conservatively.
+        let cpu_limit = if logical_cpus <= 2 {
+            1
+        } else {
+            std::cmp::min(logical_cpus - 1, (logical_cpus * 3) / 4)
+        };
+
+        // Reserve at least 75% of currently available RAM for other
+        // processes. Each parallel region is 64 MiB and has scanner/result
+        // overhead, so budget 128 MiB per worker.
         let memory_limit = available_memory_bytes()
-            .map(|bytes| std::cmp::max(1, (bytes / (80 * 1024 * 1024)) as usize))
-            .unwrap_or(logical_cpus);
-        std::cmp::min(logical_cpus, std::cmp::min(chunks, memory_limit))
+            .map(|bytes| std::cmp::max(1, ((bytes / 4) / MEMORY_PER_WORKER) as usize))
+            .unwrap_or(1);
+
+        std::cmp::max(
+            1,
+            std::cmp::min(chunks, std::cmp::min(cpu_limit, memory_limit)),
+        )
     }
 }
 

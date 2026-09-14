@@ -98,13 +98,17 @@ machines once the CPU-bound scan itself (not disk I/O) becomes the
 bottleneck — e.g. a warm page cache or fast NVMe. Library callers can use
 `extract_strings_from_file_parallel` directly.
 
-**`--auto-tune`** — selects the thread count automatically from the logical
-CPU count, available memory, and the number of 64 MiB regions in the input.
-Small files stay on the low-memory streaming path; large files use as many
-workers as the machine can safely support. It only tunes parallelism: string
-length, noise filtering, encoding, output format, and result limits remain
-unchanged so auto-tuning cannot silently discard evidence. An explicit
-`--threads N` always takes precedence.
+**`--auto-tune`** — selects a resource-conservative thread count from the
+logical CPU count, available memory, and the number of 64 MiB regions in the
+input. Small files stay on the low-memory streaming path. On larger files it
+uses at most roughly 75% of logical CPUs (always leaving at least one free)
+and budgets at most 25% of currently available RAM for scan workers. This
+reduces contention with other applications, but cannot guarantee zero impact
+from disk I/O, thermal throttling, or the output destination. It only tunes
+parallelism: string length, noise filtering, encoding, output format, and
+result limits remain unchanged. An explicit `--threads N` always takes
+precedence; use it only when you deliberately want to override the safety
+policy.
 
 `--stats` output looks like this (all read straight from the OS, no extra
 dependency):
