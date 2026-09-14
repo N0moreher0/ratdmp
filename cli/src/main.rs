@@ -404,7 +404,8 @@ fn print_report(
         for result in important {
             let reason = important_reason(&result.text).unwrap_or("interesting");
             eprintln!(
-                "      {reason:<10} {:#010x} {:<7} {}",
+                "      - {:<12} | offset {:#010x} | {:<7} | {}",
+                reason,
                 result.offset, result.encoding, result.text
             );
         }
