@@ -1,6 +1,6 @@
 use ratdmp::{
     extract_strings_from_file_parallel, extract_strings_from_file_streaming,
-    extract_strings_from_file_with_noise_config, scan_entropy_from_file_streaming,
+    extract_strings_from_file_with_noise_config,
     scan_entropy_from_file_streaming_with_data, EntropyRegion,
     ExtractedString, NoiseConfig, MAX_STRINGS, MIN_STRING_LEN,
 };
@@ -27,6 +27,7 @@ struct Args {
     noise_threshold: Option<usize>,
     threads: usize,
     auto_tune: bool,
+    entropy: bool,
     stats: bool,
 }
 
@@ -61,6 +62,7 @@ OPTIONS:
                           Repeat-noise threshold; 0 disables filtering
     --threads <N>        Parallel worker count
     --auto-tune          Choose a safe worker count for this machine
+    --entropy            Scan and export high-entropy regions
     --stats              Always-on report compatibility flag
     -h, --help           Show this help
 ";
@@ -82,6 +84,7 @@ fn parse_args() -> Result<Args, String> {
         noise_threshold: None,
         threads: 1,
         auto_tune: false,
+        entropy: false,
         stats: false,
     };
     let mut i = 0;
@@ -137,6 +140,7 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--auto-tune" => args.auto_tune = true,
+            "--entropy" => args.entropy = true,
             "--stats" => args.stats = true,
             other => return Err(format!("unknown option '{other}'")),
         }
@@ -514,12 +518,14 @@ fn main() -> Result<(), String> {
         .unwrap_or_default();
     let start = Instant::now();
     let mut entropy_regions = Vec::new();
-    scan_entropy_from_file_streaming(&args.path, ENTROPY_THRESHOLD, |region| {
-        if entropy_regions.len() < MAX_ENTROPY_REPORTS {
-            entropy_regions.push(region);
-        }
-    })
-    .map_err(|e| format!("entropy scan failed: {e}"))?;
+    if args.entropy {
+        scan_entropy_from_file_streaming_with_data(&args.path, ENTROPY_THRESHOLD, |region, _| {
+            if entropy_regions.len() < MAX_ENTROPY_REPORTS {
+                entropy_regions.push(region);
+            }
+        })
+        .map_err(|e| format!("entropy scan failed: {e}"))?;
+    }
     if threads == 1 {
         let mut writer: Box<dyn Write> = match args.output.as_ref() {
             Some(path) => Box::new(BufWriter::new(
@@ -570,25 +576,27 @@ fn main() -> Result<(), String> {
         }
         if args.format == Format::Json {
             let mut json_count = result_count;
-            scan_entropy_from_file_streaming_with_data(
-                &args.path,
-                ENTROPY_THRESHOLD,
-                |region, data| {
-                    if write_error.is_none() {
-                        if let Err(error) =
-                            write_entropy_json(region, data, &mut writer, &mut json_count)
-                        {
-                            write_error = Some(error);
+            if args.entropy {
+                scan_entropy_from_file_streaming_with_data(
+                    &args.path,
+                    ENTROPY_THRESHOLD,
+                    |region, data| {
+                        if write_error.is_none() {
+                            if let Err(error) =
+                                write_entropy_json(region, data, &mut writer, &mut json_count)
+                            {
+                                write_error = Some(error);
+                            }
                         }
-                    }
-                },
-            )
-            .map_err(|e| format!("entropy scan failed: {e}"))?;
+                    },
+                )
+                .map_err(|e| format!("entropy scan failed: {e}"))?;
+            }
             if let Some(error) = write_error {
                 return Err(format!("write failed: {error}"));
             }
             write!(writer, "\n]\n").map_err(|e| format!("write failed: {e}"))?;
-        } else {
+        } else if args.entropy {
             scan_entropy_from_file_streaming_with_data(
                 &args.path,
                 ENTROPY_THRESHOLD,
@@ -656,29 +664,31 @@ fn main() -> Result<(), String> {
             write_string_json(result, &mut writer, &mut json_count)
             .map_err(|e| format!("write failed: {e}"))?;
         }
-        let mut entropy_write_error = None;
-        scan_entropy_from_file_streaming_with_data(
+        if args.entropy {
+            let mut entropy_write_error = None;
+            scan_entropy_from_file_streaming_with_data(
             &args.path,
             ENTROPY_THRESHOLD,
             |region, data| {
-            if entropy_write_error.is_none() {
-                if let Err(error) =
-                    write_entropy_json(region, data, &mut writer, &mut json_count)
-                {
-                    entropy_write_error = Some(error);
+                if entropy_write_error.is_none() {
+                    if let Err(error) =
+                        write_entropy_json(region, data, &mut writer, &mut json_count)
+                    {
+                        entropy_write_error = Some(error);
+                    }
                 }
-            }
             },
-        )
-        .map_err(|e| format!("entropy scan failed: {e}"))?;
-        if let Some(error) = entropy_write_error {
+            )
+            .map_err(|e| format!("entropy scan failed: {e}"))?;
+            if let Some(error) = entropy_write_error {
             return Err(format!("write failed: {error}"));
+            }
         }
         writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
     } else {
         write_results(&results, args.format, &mut writer)
             .map_err(|e| format!("write failed: {e}"))?;
-        if args.format == Format::Text {
+        if args.entropy && args.format == Format::Text {
             let mut entropy_write_error = None;
             scan_entropy_from_file_streaming_with_data(
                 &args.path,
