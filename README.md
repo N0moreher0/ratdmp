@@ -214,6 +214,7 @@ The CLI adds:
 - `--noise-threshold`
 - `--threads` and `--auto-tune`
 - `--entropy` to export high-entropy memory regions
+- `--parse-pid` to map common PID markers in extracted strings
 - `-o/--output`
 - automatic scan reports and priority triage signals on `stderr`
 - IPv4/IPv6 and common crypto-wallet address hints

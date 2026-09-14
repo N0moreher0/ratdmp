@@ -28,6 +28,7 @@ struct Args {
     threads: usize,
     auto_tune: bool,
     entropy: bool,
+    parse_pid: bool,
     stats: bool,
 }
 
@@ -63,6 +64,7 @@ OPTIONS:
     --threads <N>        Parallel worker count
     --auto-tune          Choose a safe worker count for this machine
     --entropy            Scan and export high-entropy regions
+    --parse-pid          Map PID markers in extracted strings
     --stats              Always-on report compatibility flag
     -h, --help           Show this help
 ";
@@ -85,6 +87,7 @@ fn parse_args() -> Result<Args, String> {
         threads: 1,
         auto_tune: false,
         entropy: false,
+        parse_pid: false,
         stats: false,
     };
     let mut i = 0;
@@ -141,6 +144,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--auto-tune" => args.auto_tune = true,
             "--entropy" => args.entropy = true,
+            "--parse-pid" => args.parse_pid = true,
             "--stats" => args.stats = true,
             other => return Err(format!("unknown option '{other}'")),
         }
@@ -216,19 +220,46 @@ fn write_string_json(
     result: &ExtractedString,
     writer: &mut dyn Write,
     result_count: &mut usize,
+    parse_pid: bool,
 ) -> io::Result<()> {
     if *result_count > 0 {
         write!(writer, ",\n")?;
     }
     write!(
         writer,
-        "  {{\"offset\":{},\"encoding\":{},\"text\":{}}}",
+        "  {{\"offset\":{},\"encoding\":{},\"text\":{}",
         result.offset,
         json_escape(result.encoding),
         json_escape(&result.text)
     )?;
+    if parse_pid {
+        match parse_pid_marker(&result.text) {
+            Some(pid) => write!(writer, ",\"pid\":{pid}")?,
+            None => write!(writer, ",\"pid\":null")?,
+        }
+    }
+    write!(writer, "}}")?;
     *result_count += 1;
     Ok(())
+}
+
+fn parse_pid_marker(text: &str) -> Option<u32> {
+    let tokens: Vec<&str> = text
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    for (index, token) in tokens.iter().enumerate() {
+        if token.eq_ignore_ascii_case("pid") || token.eq_ignore_ascii_case("processid") {
+            if let Some(value) = tokens.get(index + 1) {
+                if value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    if let Ok(pid) = value.parse::<u32>() {
+                        return Some(pid);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn important_reason(text: &str) -> Option<&'static str> {
@@ -324,7 +355,7 @@ fn is_crypto_address(token: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_crypto_address, contains_ip_address, important_reason};
+    use super::{contains_crypto_address, contains_ip_address, important_reason, parse_pid_marker};
 
     #[test]
     fn highlights_ipv4_and_ipv6() {
@@ -349,6 +380,13 @@ mod tests {
             important_reason("wallet=0x52908400098527886E0F7030069857D2E4169EE7"),
             Some("crypto-wallet")
         );
+    }
+
+    #[test]
+    fn parses_common_pid_markers() {
+        assert_eq!(parse_pid_marker("ProcessId=4242 image.exe"), Some(4242));
+        assert_eq!(parse_pid_marker("pid: 1337"), Some(1337));
+        assert_eq!(parse_pid_marker("no process marker"), None);
     }
 }
 
@@ -430,24 +468,25 @@ fn record_result(
     medium: &mut usize,
     long: &mut usize,
     important: &mut Vec<ExtractedString>,
+    parse_pid: bool,
 ) -> io::Result<()> {
     match format {
-        Format::Text => writeln!(
-            writer,
-            "{:#010x}\t{}\t{}",
-            result.offset, result.encoding, result.text
-        )?,
-        Format::Json => {
-            if *result_count > 0 {
-                write!(writer, ",\n")?;
-            }
+        Format::Text => {
             write!(
                 writer,
-                "  {{\"offset\":{},\"encoding\":{},\"text\":{}}}",
-                result.offset,
-                json_escape(result.encoding),
-                json_escape(&result.text)
+                "{:#010x}\t{}\t{}",
+                result.offset, result.encoding, result.text
             )?;
+            if parse_pid {
+                match parse_pid_marker(&result.text) {
+                    Some(pid) => write!(writer, "\tpid={pid}")?,
+                    None => write!(writer, "\tpid=-")?,
+                }
+            }
+            writeln!(writer)?;
+        }
+        Format::Json => {
+            write_string_json(&result, writer, result_count, parse_pid)?;
         }
     }
     *result_count += 1;
@@ -466,28 +505,30 @@ fn write_results(
     results: &[ExtractedString],
     format: Format,
     writer: &mut dyn Write,
+    parse_pid: bool,
 ) -> io::Result<()> {
     match format {
         Format::Text => {
             for result in results {
-                writeln!(
+                write!(
                     writer,
                     "{:#010x}\t{}\t{}",
                     result.offset, result.encoding, result.text
                 )?;
+                if parse_pid {
+                    match parse_pid_marker(&result.text) {
+                        Some(pid) => write!(writer, "\tpid={pid}")?,
+                        None => write!(writer, "\tpid=-")?,
+                    }
+                }
+                writeln!(writer)?;
             }
         }
         Format::Json => {
             writeln!(writer, "[")?;
-            for (index, result) in results.iter().enumerate() {
-                let comma = if index + 1 < results.len() { "," } else { "" };
-                writeln!(
-                    writer,
-                    "  {{\"offset\":{},\"encoding\":{},\"text\":{}}}{comma}",
-                    result.offset,
-                    json_escape(result.encoding),
-                    json_escape(&result.text)
-                )?;
+            let mut result_count = 0;
+            for result in results {
+                write_string_json(result, writer, &mut result_count, parse_pid)?;
             }
             writeln!(writer, "]")?;
         }
@@ -565,6 +606,7 @@ fn main() -> Result<(), String> {
                         &mut medium,
                         &mut long,
                         &mut important,
+                        args.parse_pid,
                     ) {
                         write_error = Some(error);
                     }
@@ -662,7 +704,7 @@ fn main() -> Result<(), String> {
         write!(writer, "[\n").map_err(|e| format!("write failed: {e}"))?;
         let mut json_count = 0;
         for result in &results {
-            write_string_json(result, &mut writer, &mut json_count)
+            write_string_json(result, &mut writer, &mut json_count, args.parse_pid)
             .map_err(|e| format!("write failed: {e}"))?;
         }
         if args.entropy {
@@ -687,7 +729,7 @@ fn main() -> Result<(), String> {
         }
         writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
     } else {
-        write_results(&results, args.format, &mut writer)
+        write_results(&results, args.format, &mut writer, args.parse_pid)
             .map_err(|e| format!("write failed: {e}"))?;
         if args.entropy && args.format == Format::Text {
             let mut entropy_write_error = None;

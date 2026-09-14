@@ -47,6 +47,8 @@ ratdmp memory.dmp --noise-threshold 16 --threads 4
 - Text output includes the same `Undefined` entropy records with
   `length`, `entropy`, and `data_hex` fields.
 - Entropy scanning is opt-in to preserve default scan speed.
+- `--parse-pid` adds a `pid` field to JSON or a `pid=...` column to text output
+  when a string contains a `PID=`/`ProcessId=` marker.
 - Automatic scan summary and priority triage signals on `stderr`.
 - IPv4/IPv6 and common crypto-wallet address triage signals.
 - Clean stdout for shell pipelines and automation.
