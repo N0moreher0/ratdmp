@@ -1,11 +1,12 @@
 [package]
 name = "ratdmp"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Fast streaming ASCII/UTF-16LE string extractor for raw memory dump (.dmp) files, with simple noise filtering for byte-fill/heap-fill patterns. Never loads the whole file into RAM."
 readme = "README.md"
 repository = "https://github.com/N0moreher0/ratdmp"
+exclude = ["sample_demo.dmp"]
 keywords = ["strings", "forensics", "memory-dump", "malware", "dfir"]
 categories = ["parsing", "command-line-utilities"]
 rust-version = "1.70"
@@ -18,14 +19,6 @@ rust-version = "1.70"
 # JSON-lines IPC).
 serde = { version = "1", features = ["derive"] }
 
-# Used only by the opt-in parallel scanning path (`extract_strings_from_file_parallel`,
-# CLI `--threads N`). Work-stealing thread pool for splitting the file scan
-# across cores. Not required by the default single-threaded/streaming path.
+# Used by the opt-in parallel scanning path. Work-stealing thread pool for
+# splitting the file scan across cores.
 rayon = "1"
-
-# CLI: a separate binary, with hand-rolled arg parsing and hand-rolled
-# JSON output -- NO extra dependencies added (no clap, no serde_json),
-# keeping this crate's "exactly one dependency" philosophy.
-[[bin]]
-name = "ratdmp"
-path = "src/bin/ratdmp.rs"

@@ -7,240 +7,201 @@
                 |_| |_| |_|\__,_|_|  \___/| .__/
                                           |_|
 
-        Fast memory-dump string triage for DFIR and malware analysis
+             Fast, composable memory-dump string extraction
 ```
 
-> **Extract fast. Triage immediately. Keep stdout automation-friendly.**
+> **A focused Rust library for building your own DFIR and malware-analysis
+> tooling.**
 
 [![Crates.io](https://img.shields.io/crates/v/ratdmp?logo=rust)](https://crates.io/crates/ratdmp)
 [![Documentation](https://img.shields.io/docsrs/ratdmp?logo=docs.rs)](https://docs.rs/ratdmp)
 [![License](https://img.shields.io/crates/l/ratdmp)](https://github.com/N0moreher0/ratdmp)
 
-Fast, streaming ASCII / UTF-16LE string extractor for raw memory dump
-(`.dmp`) files — with simple, conservative noise filtering for
-byte-fill / heap-fill patterns and built-in IOC-oriented triage. Written for
-malware analysis, DFIR, and memory-forensics workflows.
+`ratdmp` is a library-first, streaming ASCII/UTF-16LE string extractor for
+raw memory dumps and other binary payloads. It provides the extraction engine,
+noise filtering, bounded parallel scanning, and serializable results; your
+application owns the UI, IOC rules, storage, alerting, and reporting.
 
-## Why
+## Why ratdmp?
 
-Running something like Unix `strings` on a multi-gigabyte memory dump
-usually means: (1) reading the whole file into RAM, and (2) getting
-flooded with junk like `AAAAAAAA...` or `ABABABAB...` from Windows
-heap padding / byte-fill patterns, alongside the IOCs you actually
-care about.
+Memory dumps are large, noisy, and full of useful evidence hidden among
+padding bytes. `ratdmp` gives applications a predictable core:
 
-`ratdmp` fixes both:
+- **Streaming by default**: scan multi-gigabyte files without loading them
+  completely into RAM.
+- **Dual encoding support**: detect ASCII and UTF-16LE in the same pass.
+- **Conservative noise filtering**: suppress clear period-1 and period-2
+  fill patterns while preserving short evidence.
+- **Configurable behavior**: control minimum length, result limits, and noise
+  thresholds from Rust.
+- **Parallel when useful**: opt into bounded region-based scanning with Rayon.
+- **Composable output**: receive sorted `ExtractedString` values and decide
+  how your application classifies, displays, or stores them.
+- **Library-only crate**: no bundled CLI, terminal policy, IOC assumptions, or
+  output format imposed on downstream users.
 
-- **Streaming.** Reads the file in 32MB chunks (`extract_strings_from_file`
-  / `extract_strings_from_reader`), never loading the entire dump into
-  memory. A `.dmp` file can be many gigabytes — this crate's peak memory
-  use does not scale with file size.
-- **Single-pass, dual-encoding.** ASCII and UTF-16LE runs are detected in
-  the *same* scan over the buffer, not two separate passes.
-- **Conservative noise filtering.** Runs that are pure period-1
-  (`aaaaaaaa...`) or period-2 (`ababab...`) repeats, above a length
-  threshold, are dropped as low-information byte-fill noise. Short
-  repeats (like `"0000"`) are deliberately kept, since they can be real
-  data (PINs, years, etc.) — the filter only removes patterns long
-  enough to be confidently noise, never sacrificing recall for short
-  strings.
-- **Built-in triage signals.** The CLI surfaces likely credentials, tokens,
-  secrets, URLs, network indicators, and email addresses in a highlighted
-  priority section while preserving every extracted result in stdout.
-- **Terminal-first UX.** A polished banner, scan status, grouped length
-  summary, throughput, peak memory, and priority findings are printed to
-  `stderr`; text and JSON results remain safe for scripts and pipelines.
+## Installation
 
-## At a glance
+```toml
+[dependencies]
+ratdmp = "0.5"
+```
 
-| Capability | Details |
-| --- | --- |
-| Input | Raw `.dmp` files or any binary payload |
-| Encodings | ASCII and UTF-16LE in one scan |
-| Processing | Streaming by default; bounded parallel regions available |
-| Noise filter | Conservative period-1 and period-2 fill-pattern detection |
-| Triage | Credential/token/secret, URL, network, and email indicators |
-| Output | Human-readable text or machine-readable JSON |
-| Scale | Hardware-aware `--auto-tune` with CPU/RAM safety limits |
-| Dependencies | No CLI framework or JSON runtime dependency |
+Or:
 
-## Usage
+```bash
+cargo add ratdmp
+```
+
+The crate exposes a Rust API only. Build your own CLI, service, desktop
+application, forensic pipeline, or scripting integration around it.
+
+## Quick start
 
 ```rust
 use ratdmp::extract_strings_from_file;
 
 fn main() -> std::io::Result<()> {
-    let strings = extract_strings_from_file("memory.dmp", /* min_len */ 4, /* max_strings */ 200_000)?;
-    for s in &strings {
-        println!("[{}] offset={} {:?}", s.encoding, s.offset, s.text);
+    let strings = extract_strings_from_file(
+        "memory.dmp",
+        4,       // minimum string length
+        200_000, // maximum results
+    )?;
+
+    for result in strings {
+        println!(
+            "{:#010x}\t{}\t{}",
+            result.offset, result.encoding, result.text
+        );
     }
     Ok(())
 }
 ```
 
-Already have the bytes in memory instead of a file on disk? Use
-`extract_strings(&data, min_len, max_strings)`. Reading from any
-`std::io::Read` (a socket, a pipe, a decompression stream, …)? Use
-`extract_strings_from_reader(reader, min_len, max_strings, estimated_len)`.
+## API surface
 
-Each result is an `ExtractedString { offset: u64, encoding: &'static str, text: String }`
-(`encoding` is `"ascii"` or `"utf16le"`), sorted by `offset`. The struct
-derives `serde::Serialize` if you want to hand it off as JSON.
+| API | Use case |
+| --- | --- |
+| `extract_strings` | Scan bytes already held in memory |
+| `extract_strings_with_noise_config` | In-memory scan with custom filtering |
+| `extract_strings_from_reader` | Stream from any `std::io::Read` |
+| `extract_strings_from_reader_with_noise_config` | Stream with custom filtering |
+| `extract_strings_from_file` | Scan a file with bounded memory |
+| `extract_strings_from_file_with_noise_config` | File scan with custom filtering |
+| `extract_strings_from_file_parallel` | Opt-in parallel file scan |
+| `NoiseConfig` | Configure or disable repeat-pattern filtering |
 
-## CLI
+Every result is an `ExtractedString`:
 
-The crate also ships a `ratdmp` binary — arg parsing and JSON output are
-hand-rolled (no clap, no serde_json).
-
-**Pre-built binaries:** grab the latest `.exe`/binary for Linux, Windows,
-or macOS (x86_64 + Apple Silicon) from the [Releases
-page](https://github.com/N0moreher0/ratdmp/releases) — no Rust toolchain
-needed. Every release also ships a `SHA256SUMS` file to verify the download.
-
-Or build/install from source:
-
-```bash
-cargo install ratdmp
-
-ratdmp lsass.dmp
-ratdmp lsass.dmp --min-len 6 --format json -o strings.json
-ratdmp lsass.dmp --encoding utf16 --max-strings 5000
-ratdmp lsass.dmp --noise-threshold 16
-ratdmp lsass.dmp --threads 8
-ratdmp lsass.dmp --auto-tune
-ratdmp --help
+```rust
+pub struct ExtractedString {
+    pub offset: u64,
+    pub encoding: &'static str, // "ascii" or "utf16le"
+    pub text: String,
+}
 ```
 
-Options: `--min-len <N>`, `--max-strings <N>`, `--format <text|json>`,
-`--encoding <all|ascii|utf16>`, `-o/--output <path>` (defaults to stdout),
-`--stats` (legacy no-op; the report is now automatic).
-Text format is `offset\tencoding\ttext` per line; JSON format is a plain
-array of `{"offset":...,"encoding":...,"text":...}`.
+Results are sorted by ascending offset. `ExtractedString` derives
+`serde::Serialize`, so applications can emit JSON, NDJSON, database records,
+or any custom protocol without pulling a serializer into this crate.
 
-### Recommended workflows
+## Filtering and evidence policy
 
-```bash
-# Fast interactive triage; UI and priority findings go to stderr.
-ratdmp memory.dmp --auto-tune
+The default filter targets two high-confidence low-information shapes:
 
-# Clean text stream for grep, awk, or another forensic tool.
-ratdmp memory.dmp --auto-tune 2>scan-report.txt | grep -Ei 'token|secret|http'
+- period-1 repeats: `AAAAAAAAAAAA`
+- period-2 repeats: `ABABABABABAB`
 
-# Stable JSON artifact for automation.
-ratdmp memory.dmp --format json --auto-tune -o strings.json 2>scan-report.txt
+Short repeats remain available because values such as `0000` can be meaningful
+evidence. Use `NoiseConfig` when your workload needs a different trade-off:
 
-# Focus on UTF-16LE strings and retain a larger result set.
-ratdmp memory.dmp --encoding utf16 --max-strings 500000 -o utf16.txt
+```rust
+use ratdmp::{
+    extract_strings_from_file_with_noise_config,
+    NoiseConfig,
+};
+
+let config = NoiseConfig::from_threshold(16);
+let strings = extract_strings_from_file_with_noise_config(
+    "memory.dmp",
+    6,
+    500_000,
+    config,
+)?;
 ```
 
-### Terminal UI and automatic report
+To preserve all repeat patterns:
 
-When running interactively, ratdmp shows a structured banner, scan status, and
-summary panel inspired by modern open-source CLI tools. The report is always
-written to `stderr`, so stdout remains clean for pipes, redirected text, and
-JSON parsers:
-
-```text
-+------------------------------------------------------------+
-| ratdmp v0.4.0 | memory-dump string triage                 |
-+------------------------------------------------------------+
-  input  sample_demo.dmp  |  5.42 KiB  |  text
-  [..] scanning
-  [OK] scan complete
-+-------------------- summary -----------------------------+
-  results      : 15
-  length       : 2 short | 4 medium | 9 long
-  threads      : 1
-  file size    : 5.42 KiB
-  elapsed      : 26.235 ms
-  throughput   : 206.41 KiB/s
-  peak memory  : 36.35 MiB
-+------------------------------------------------------------+
-  [!] priority findings (up to 12)
-      credential 0x00000624 ascii   discord_token=...
-      email      0x00000724 ascii   analyst@example.test
+```rust
+let config = NoiseConfig::disabled();
 ```
 
-Results are grouped by text length (`short` 4-7, `medium` 8-31, `long` 32+).
-Likely high-value strings such as credentials, tokens, secrets, URLs, network
-indicators, and email addresses are listed separately and highlighted with
-ANSI color when stderr is a terminal. Color is disabled automatically when
-output is redirected. The UI never writes ANSI escape sequences to redirected
-output and never contaminates stdout, making it suitable for shell pipelines
-and automation. These are triage signals, not proof that a string is valid,
-active, or malicious; validate findings in their surrounding memory context.
+The library does not classify IOC content, apply vendor-specific rules, or
+decide what is malicious. That is intentional: downstream applications can
+layer their own regexes, YARA rules, enrichment, confidence scoring, privacy
+handling, and reporting without fighting a bundled CLI policy.
 
-**`--noise-threshold <N>`** — configures the byte-fill/heap-fill noise
-filter instead of the hardcoded defaults (period-1 repeats like `aaaa`
-need length `N`, period-2 repeats like `abab` need `N+2`). `0` disables
-the filter entirely, so nothing gets dropped. Library callers get the same
-control via `NoiseConfig` and the `*_with_noise_config` functions.
+## Streaming and parallel scanning
 
-**`--threads <N>`** — scans using an N-worker `rayon` work-stealing pool
-instead of the default single-threaded streaming scan. `1` (default) is
-the original sequential/streaming path: constant peak memory regardless of
-file size, best for very large dumps or slow disks. `>1` splits the file
-into 64MB regions scanned in parallel, which is faster on multi-core
-machines once the CPU-bound scan itself (not disk I/O) becomes the
-bottleneck — e.g. a warm page cache or fast NVMe. Library callers can use
-`extract_strings_from_file_parallel` directly.
+The normal file and reader APIs use bounded streaming memory. They are a good
+default for very large dumps, slow disks, and memory-constrained systems.
 
-**`--auto-tune`** — selects a resource-conservative thread count from the
-logical CPU count, available memory, and the number of 64 MiB regions in the
-input. Small files stay on the low-memory streaming path. On larger files it
-uses at most roughly 75% of logical CPUs (always leaving at least one free)
-and budgets at most 25% of currently available RAM for scan workers. This
-means a machine with more CPU/RAM scales to more workers, while a low-memory
-machine automatically backs off. On platforms where available RAM cannot be
-queried, the CPU cap remains active and the bounded worker buffers are used.
-This reduces contention with other applications, but cannot guarantee zero
-impact from disk I/O, thermal throttling, or the output destination. It only
-tunes parallelism: string length, noise filtering, encoding, output format,
-and result limits remain unchanged. An explicit `--threads N` always takes
-precedence; use it only when you deliberately want to override the safety
-policy.
+For fast storage and CPU-heavy workloads, use the parallel API inside your own
+controlled worker pool:
 
-The automatic report reads timing and memory directly from the OS (without an
-extra dependency):
+```rust
+use ratdmp::{
+    extract_strings_from_file_parallel,
+    NoiseConfig,
+};
 
-```
-  [OK] scan complete
-+-------------------- summary -----------------------------+
-  results      : 262
-  length       : 41 short | 136 medium | 85 long
-  threads      : 8
-  file size    : 64.00 MiB
-  elapsed      : 200.209 ms
-  throughput   : 319.68 MiB/s
-  peak memory  : 34.12 MiB
-+------------------------------------------------------------+
+let strings = extract_strings_from_file_parallel(
+    "memory.dmp",
+    4,
+    500_000,
+    NoiseConfig::default(),
+)?;
 ```
 
-`peak RSS` is read from `/proc/self/status` (Linux) or
-`GetProcessMemoryInfo` (Windows, via raw FFI) -- it prints `n/a` on other
-platforms rather than guessing.
+The parallel API divides the input into fixed regions, preserves offsets, and
+returns results in sorted order. Configure Rayon's thread pool in your
+application when you need an explicit CPU/RAM policy.
 
-## Scope and boundaries
+## Building an application around ratdmp
 
-- No `.dmp`/MDMP structural parsing (no stream/module/thread table
-  lookups) — it treats the file as a raw byte payload and scans the
-  whole thing. This is intentional: it makes the extractor independent
-  of the specific minidump format version or which tool produced it.
-- The CLI provides lightweight IOC-oriented triage signals for common
-  credential, token, secret, URL, network, and email patterns. It does not
-  claim that a highlighted string is valid, active, or malicious.
-- No aggressive entropy-based suppression or broad deduplication is applied.
-  The default favors evidence preservation; use `--noise-threshold`,
-  `--min-len`, `--encoding`, and `--max-strings` to tune collection for a
-  specific investigation.
+The crate deliberately leaves these product decisions to you:
+
+- CLI arguments and terminal UI
+- IOC and credential detection
+- JSON, CSV, NDJSON, or database output
+- progress bars and cancellation
+- case management and evidence provenance
+- redaction, access control, and retention
+- YARA, regex, entropy, or threat-intelligence enrichment
+
+This makes the core suitable for both a minimal `strings`-style utility and a
+full forensic pipeline.
+
+## Performance characteristics
+
+- Single-pass ASCII/UTF-16LE extraction.
+- Constant-memory streaming path with respect to file size.
+- Parallel path bounded by active worker regions, not total file size.
+- Result collection is capped by `max_strings`.
+- No `.dmp`/MDMP structural parsing: the input is treated as raw bytes so the
+  extractor remains independent of minidump format and producer.
+
+Benchmark your target storage, CPU, and result density with your own dump
+corpus. Output volume and downstream processing often dominate end-to-end
+runtime after extraction.
 
 ## Minimum supported Rust version
 
-1.70 (uses `const fn` with loops for the printable-byte lookup table).
+Rust 1.70.
 
 ## License
 
-Licensed under either of
+Licensed under either of:
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
   <http://www.apache.org/licenses/LICENSE-2.0>)
@@ -248,10 +209,3 @@ Licensed under either of
   <http://opensource.org/licenses/MIT>)
 
 at your option.
-
-### Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally
-submitted for inclusion in the work by you, as defined in the
-Apache-2.0 license, shall be dual licensed as above, without any
-additional terms or conditions.
