@@ -128,6 +128,9 @@ impl NoiseConfig {
 // File chunk size per read -- large enough for efficient I/O,
 // small enough to not accumulate too much RAM for the buffer.
 const CHUNK_SIZE: usize = 32 * 1024 * 1024;
+/// Fixed window used by the entropy pass. Keeping this separate from the
+/// string-scan chunk makes entropy results comparable across files.
+pub const ENTROPY_BLOCK_SIZE: usize = 64 * 1024;
 
 // Upper bound on the length of a currently-open "run" before it's forced
 // to flush into the results -- guards against an unusually long run of
@@ -143,6 +146,77 @@ pub struct ExtractedString {
     pub offset: u64,
     pub encoding: &'static str,
     pub text: String,
+}
+
+/// A fixed file region whose byte distribution has high Shannon entropy.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct EntropyRegion {
+    pub offset: u64,
+    pub length: usize,
+    pub entropy: f64,
+}
+
+/// Computes Shannon entropy in bits per byte for a byte slice.
+pub fn shannon_entropy(data: &[u8]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0usize; 256];
+    for &byte in data {
+        counts[byte as usize] += 1;
+    }
+    let len = data.len() as f64;
+    counts
+        .iter()
+        .filter(|&&count| count != 0)
+        .map(|&count| {
+            let probability = count as f64 / len;
+            -probability * probability.log2()
+        })
+        .sum()
+}
+
+/// Streams high-entropy fixed-size regions from a file.
+///
+/// This is a heuristic signal for compressed, encrypted, or packed data. It
+/// does not identify which of those cases applies and does not decrypt data.
+pub fn scan_entropy_from_file_streaming<F: FnMut(EntropyRegion)>(
+    dump_path: &str,
+    threshold: f64,
+    mut on_region: F,
+) -> std::io::Result<usize> {
+    let mut file = File::open(dump_path)?;
+    let mut buffer = vec![0u8; ENTROPY_BLOCK_SIZE];
+    let mut offset = 0u64;
+    let mut matches = 0usize;
+
+    loop {
+        let mut filled = 0usize;
+        while filled < buffer.len() {
+            let read = file.read(&mut buffer[filled..])?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        if filled == 0 {
+            break;
+        }
+        let entropy = shannon_entropy(&buffer[..filled]);
+        if entropy >= threshold {
+            matches += 1;
+            on_region(EntropyRegion {
+                offset,
+                length: filled,
+                entropy,
+            });
+        }
+        offset += filled as u64;
+        if filled < buffer.len() {
+            break;
+        }
+    }
+    Ok(matches)
 }
 
 /// The printable-character set: printable ASCII + common whitespace,
@@ -736,6 +810,15 @@ mod tests {
         assert!(out
             .iter()
             .any(|s| s.encoding == "ascii" && s.text == "hello world"));
+    }
+
+    #[test]
+    fn entropy_distinguishes_uniform_and_mixed_data() {
+        let uniform = vec![0u8; 1024];
+        assert_eq!(shannon_entropy(&uniform), 0.0);
+
+        let mixed: Vec<u8> = (0..=255).cycle().take(4096).collect();
+        assert!((shannon_entropy(&mixed) - 8.0).abs() < f64::EPSILON);
     }
 
     #[test]

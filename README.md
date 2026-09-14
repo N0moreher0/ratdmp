@@ -70,6 +70,9 @@ padding bytes. `ratdmp` gives applications a predictable core:
 - **Dual encoding support**: detect ASCII and UTF-16LE in the same pass.
 - **Conservative noise filtering**: suppress clear period-1 and period-2
   fill patterns while preserving short evidence.
+- **Entropy hints**: identify fixed-size regions with high byte-distribution
+  entropy as possible compressed, encrypted, or packed data; no decryption is
+  attempted.
 - **Configurable behavior**: control minimum length, result limits, and noise
   thresholds from Rust.
 - **Parallel when useful**: opt into bounded region-based scanning with Rayon.

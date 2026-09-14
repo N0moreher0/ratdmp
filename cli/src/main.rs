@@ -1,11 +1,14 @@
 use ratdmp::{
     extract_strings_from_file_parallel, extract_strings_from_file_streaming,
-    extract_strings_from_file_with_noise_config,
+    extract_strings_from_file_with_noise_config, scan_entropy_from_file_streaming, EntropyRegion,
     ExtractedString, NoiseConfig, MAX_STRINGS, MIN_STRING_LEN,
 };
 use std::fs::File;
 use std::io::{self, BufWriter, IsTerminal, Write};
 use std::time::Instant;
+
+const ENTROPY_THRESHOLD: f64 = 7.2;
+const MAX_ENTROPY_REPORTS: usize = 12;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Format {
@@ -304,6 +307,7 @@ fn print_report(
     medium: usize,
     long: usize,
     important: &[ExtractedString],
+    entropy_regions: &[EntropyRegion],
     size: u64,
     elapsed: f64,
     threads: usize,
@@ -336,7 +340,15 @@ fn print_report(
             );
         }
     }
-
+    if !entropy_regions.is_empty() {
+        eprintln!("  [!] high-entropy regions (showing up to 12)");
+        for region in entropy_regions {
+            eprintln!(
+                "      offset {:#010x}  {:>6} bytes  entropy {:.3}/8.000",
+                region.offset, region.length, region.entropy
+            );
+        }
+    }
 }
 
 fn record_result(
@@ -436,6 +448,13 @@ fn main() -> Result<(), String> {
         .map(NoiseConfig::from_threshold)
         .unwrap_or_default();
     let start = Instant::now();
+    let mut entropy_regions = Vec::new();
+    scan_entropy_from_file_streaming(&args.path, ENTROPY_THRESHOLD, |region| {
+        if entropy_regions.len() < MAX_ENTROPY_REPORTS {
+            entropy_regions.push(region);
+        }
+    })
+    .map_err(|e| format!("entropy scan failed: {e}"))?;
     if threads == 1 {
         let mut writer: Box<dyn Write> = match args.output.as_ref() {
             Some(path) => Box::new(BufWriter::new(
@@ -492,7 +511,7 @@ fn main() -> Result<(), String> {
             eprintln!("wrote {result_count} results to '{path}'");
         }
         print_report(
-            result_count, short, medium, long, &important, file_size,
+            result_count, short, medium, long, &important, &entropy_regions, file_size,
             start.elapsed().as_secs_f64(), threads,
         );
         return Ok(());
@@ -556,7 +575,7 @@ fn main() -> Result<(), String> {
         }
     }
     print_report(
-        results.len(), short, medium, long, &important, file_size,
+        results.len(), short, medium, long, &important, &entropy_regions, file_size,
         start.elapsed().as_secs_f64(), threads,
     );
     Ok(())
