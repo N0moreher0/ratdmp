@@ -1,6 +1,7 @@
 use ratdmp::{
     extract_strings_from_file_parallel, extract_strings_from_file_streaming,
-    extract_strings_from_file_with_noise_config, scan_entropy_from_file_streaming, EntropyRegion,
+    extract_strings_from_file_with_noise_config, scan_entropy_from_file_streaming,
+    scan_entropy_from_file_streaming_with_data, EntropyRegion,
     ExtractedString, NoiseConfig, MAX_STRINGS, MIN_STRING_LEN,
 };
 use std::fs::File;
@@ -157,9 +158,58 @@ fn json_escape(value: &str) -> String {
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
+
     }
     out.push('"');
     out
+}
+
+fn hex_encode(data: &[u8]) -> String {
+    let mut encoded = String::with_capacity(data.len() * 2);
+    for byte in data {
+        encoded.push_str(&format!("{byte:02x}"));
+    }
+    encoded
+}
+
+fn write_entropy_json(
+    region: EntropyRegion,
+    data: &[u8],
+    writer: &mut dyn Write,
+    result_count: &mut usize,
+) -> io::Result<()> {
+    if *result_count > 0 {
+        write!(writer, ",\n")?;
+    }
+    write!(
+        writer,
+        "  {{\"group\":\"Undefined\",\"offset\":{},\"length\":{},\"entropy\":{:.6},\"data_hex\":{}}}",
+        region.offset,
+        region.length,
+        region.entropy,
+        json_escape(&hex_encode(data))
+    )?;
+    *result_count += 1;
+    Ok(())
+}
+
+fn write_string_json(
+    result: &ExtractedString,
+    writer: &mut dyn Write,
+    result_count: &mut usize,
+) -> io::Result<()> {
+    if *result_count > 0 {
+        write!(writer, ",\n")?;
+    }
+    write!(
+        writer,
+        "  {{\"offset\":{},\"encoding\":{},\"text\":{}}}",
+        result.offset,
+        json_escape(result.encoding),
+        json_escape(&result.text)
+    )?;
+    *result_count += 1;
+    Ok(())
 }
 
 fn important_reason(text: &str) -> Option<&'static str> {
@@ -504,6 +554,24 @@ fn main() -> Result<(), String> {
             return Err(format!("write failed: {error}"));
         }
         if args.format == Format::Json {
+            let mut json_count = result_count;
+            scan_entropy_from_file_streaming_with_data(
+                &args.path,
+                ENTROPY_THRESHOLD,
+                |region, data| {
+                    if write_error.is_none() {
+                        if let Err(error) =
+                            write_entropy_json(region, data, &mut writer, &mut json_count)
+                        {
+                            write_error = Some(error);
+                        }
+                    }
+                },
+            )
+            .map_err(|e| format!("entropy scan failed: {e}"))?;
+            if let Some(error) = write_error {
+                return Err(format!("write failed: {error}"));
+            }
             write!(writer, "\n]\n").map_err(|e| format!("write failed: {e}"))?;
         }
         writer.flush().map_err(|e| format!("write failed: {e}"))?;
@@ -543,21 +611,46 @@ fn main() -> Result<(), String> {
         })
         .collect();
 
-    match args.output {
-        Some(path) => {
-            let file = File::create(&path).map_err(|e| format!("cannot create '{path}': {e}"))?;
-            write_results(&results, args.format, &mut BufWriter::new(file))
-                .map_err(|e| format!("write failed: {e}"))?;
-            eprintln!("wrote {} results to '{path}'", results.len());
-        }
-        None => {
-            write_results(
-                &results,
-                args.format,
-                &mut BufWriter::new(io::stdout().lock()),
-            )
+    let output_path = args.output.clone();
+    let mut writer: Box<dyn Write> = match output_path.as_ref() {
+        Some(path) => Box::new(BufWriter::new(
+            File::create(path).map_err(|e| format!("cannot create '{path}': {e}"))?,
+        )),
+        None => Box::new(BufWriter::new(io::stdout().lock())),
+    };
+    if args.format == Format::Json {
+        write!(writer, "[\n").map_err(|e| format!("write failed: {e}"))?;
+        let mut json_count = 0;
+        for result in &results {
+            write_string_json(result, &mut writer, &mut json_count)
             .map_err(|e| format!("write failed: {e}"))?;
         }
+        let mut entropy_write_error = None;
+        scan_entropy_from_file_streaming_with_data(
+            &args.path,
+            ENTROPY_THRESHOLD,
+            |region, data| {
+            if entropy_write_error.is_none() {
+                if let Err(error) =
+                    write_entropy_json(region, data, &mut writer, &mut json_count)
+                {
+                    entropy_write_error = Some(error);
+                }
+            }
+            },
+        )
+        .map_err(|e| format!("entropy scan failed: {e}"))?;
+        if let Some(error) = entropy_write_error {
+            return Err(format!("write failed: {error}"));
+        }
+        writeln!(writer, "\n]").map_err(|e| format!("write failed: {e}"))?;
+    } else {
+        write_results(&results, args.format, &mut writer)
+            .map_err(|e| format!("write failed: {e}"))?;
+    }
+    writer.flush().map_err(|e| format!("write failed: {e}"))?;
+    if let Some(path) = output_path {
+        eprintln!("wrote {} results to '{path}'", results.len());
     }
     let _ = args.stats;
     let mut short = 0;

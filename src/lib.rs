@@ -185,6 +185,18 @@ pub fn scan_entropy_from_file_streaming<F: FnMut(EntropyRegion)>(
     threshold: f64,
     mut on_region: F,
 ) -> std::io::Result<usize> {
+    scan_entropy_from_file_streaming_with_data(dump_path, threshold, |region, _data| {
+        on_region(region);
+    })
+}
+
+/// Like [`scan_entropy_from_file_streaming`], but also provides each matching
+/// block's bytes to the callback before the scan buffer is reused.
+pub fn scan_entropy_from_file_streaming_with_data<F: FnMut(EntropyRegion, &[u8])>(
+    dump_path: &str,
+    threshold: f64,
+    mut on_region: F,
+) -> std::io::Result<usize> {
     let mut file = File::open(dump_path)?;
     let mut buffer = vec![0u8; ENTROPY_BLOCK_SIZE];
     let mut offset = 0u64;
@@ -205,11 +217,12 @@ pub fn scan_entropy_from_file_streaming<F: FnMut(EntropyRegion)>(
         let entropy = shannon_entropy(&buffer[..filled]);
         if entropy >= threshold {
             matches += 1;
-            on_region(EntropyRegion {
+            let region = EntropyRegion {
                 offset,
                 length: filled,
                 entropy,
-            });
+            };
+            on_region(region, &buffer[..filled]);
         }
         offset += filled as u64;
         if filled < buffer.len() {

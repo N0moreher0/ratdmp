@@ -73,6 +73,8 @@ padding bytes. `ratdmp` gives applications a predictable core:
 - **Entropy hints**: identify fixed-size regions with high byte-distribution
   entropy as possible compressed, encrypted, or packed data; no decryption is
   attempted.
+- In CLI JSON output, matching regions are emitted as `group: "Undefined"`
+  records with `offset`, `length`, `entropy`, and `data_hex`.
 - **Configurable behavior**: control minimum length, result limits, and noise
   thresholds from Rust.
 - **Parallel when useful**: opt into bounded region-based scanning with Rayon.
