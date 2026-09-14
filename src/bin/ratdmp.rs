@@ -11,9 +11,12 @@
 //! `GetProcessMemoryInfo` on Windows via raw FFI) instead of pulling in a
 //! crate like `sysinfo` just for one number.
 
-use ratdmp::{extract_strings_from_file, ExtractedString, MAX_STRINGS, MIN_STRING_LEN};
+use ratdmp::{
+    extract_strings_from_file_parallel, extract_strings_from_file_with_noise_config,
+    ExtractedString, NoiseConfig, MAX_STRINGS, MIN_STRING_LEN,
+};
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufRead, BufWriter, IsTerminal, Write};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -113,6 +116,8 @@ struct Args {
     encoding: EncodingFilter,
     output: Option<String>,
     stats: bool,
+    noise_threshold: Option<usize>,
+    threads: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -142,13 +147,30 @@ OPTIONS:
                           Filter by encoding (default all)
     -o, --output <path>  Write to a file instead of stdout
     --stats               Print timing/throughput/peak-RSS stats to stderr
+    --noise-threshold <N> Min run length for the byte-fill/heap-fill noise
+                          filter (period-1 repeats use N, period-2 use N+2).
+                          0 disables the filter entirely. (default: 6)
+    --threads <N>         Scan using N worker threads (rayon work-stealing
+                          pool) instead of the single-threaded streaming
+                          scanner. 1 = sequential/streaming (default, lowest
+                          peak memory, works on files of any size). >1 =
+                          parallel scan, faster on multi-core machines with
+                          fast storage / a warm page cache.
     -h, --help            Print this help
+
+NOTE:
+    When results are printed to stdout (no -o given) and both stdin and
+    stdout are a real terminal, ratdmp asks afterwards whether to also
+    save the filtered results to a file [y/N]. This prompt is skipped
+    automatically when piping or redirecting output.
 
 EXAMPLES:
     ratdmp lsass.dmp
     ratdmp lsass.dmp --min-len 6 --format json -o strings.json
     ratdmp lsass.dmp --encoding utf16 --max-strings 5000
     ratdmp lsass.dmp --stats -o strings.txt
+    ratdmp lsass.dmp --noise-threshold 16
+    ratdmp lsass.dmp --threads 8 --stats
 ";
 
 fn parse_args() -> Result<Args, String> {
@@ -161,7 +183,9 @@ fn parse_args() -> Result<Args, String> {
 
     let path = raw.remove(0);
     if path.starts_with('-') {
-        return Err(format!("missing path (the first arg must be a file path, got '{path}')"));
+        return Err(format!(
+            "missing path (the first arg must be a file path, got '{path}')"
+        ));
     }
 
     let mut min_len = MIN_STRING_LEN;
@@ -170,6 +194,8 @@ fn parse_args() -> Result<Args, String> {
     let mut encoding = EncodingFilter::All;
     let mut output: Option<String> = None;
     let mut stats = false;
+    let mut noise_threshold: Option<usize> = None;
+    let mut threads: usize = 1;
 
     let mut i = 0usize;
     while i < raw.len() {
@@ -177,17 +203,23 @@ fn parse_args() -> Result<Args, String> {
         macro_rules! next_val {
             () => {{
                 i += 1;
-                raw.get(i).ok_or_else(|| format!("missing value after '{arg}'"))?.clone()
+                raw.get(i)
+                    .ok_or_else(|| format!("missing value after '{arg}'"))?
+                    .clone()
             }};
         }
         match arg {
             "--min-len" => {
                 let v = next_val!();
-                min_len = v.parse::<usize>().map_err(|_| format!("--min-len is not a valid number: '{v}'"))?;
+                min_len = v
+                    .parse::<usize>()
+                    .map_err(|_| format!("--min-len is not a valid number: '{v}'"))?;
             }
             "--max-strings" => {
                 let v = next_val!();
-                max_strings = v.parse::<usize>().map_err(|_| format!("--max-strings is not a valid number: '{v}'"))?;
+                max_strings = v
+                    .parse::<usize>()
+                    .map_err(|_| format!("--max-strings is not a valid number: '{v}'"))?;
             }
             "--format" => {
                 let v = next_val!();
@@ -203,7 +235,11 @@ fn parse_args() -> Result<Args, String> {
                     "all" => EncodingFilter::All,
                     "ascii" => EncodingFilter::Ascii,
                     "utf16" => EncodingFilter::Utf16,
-                    _ => return Err(format!("--encoding must be 'all'/'ascii'/'utf16', got '{v}'")),
+                    _ => {
+                        return Err(format!(
+                            "--encoding must be 'all'/'ascii'/'utf16', got '{v}'"
+                        ))
+                    }
                 };
             }
             "-o" | "--output" => {
@@ -212,12 +248,38 @@ fn parse_args() -> Result<Args, String> {
             "--stats" => {
                 stats = true;
             }
+            "--noise-threshold" => {
+                let v = next_val!();
+                let parsed = v
+                    .parse::<usize>()
+                    .map_err(|_| format!("--noise-threshold is not a valid number: '{v}'"))?;
+                noise_threshold = Some(parsed);
+            }
+            "--threads" => {
+                let v = next_val!();
+                threads = v
+                    .parse::<usize>()
+                    .map_err(|_| format!("--threads is not a valid number: '{v}'"))?;
+                if threads == 0 {
+                    return Err("--threads must be at least 1".to_string());
+                }
+            }
             other => return Err(format!("unrecognized arg: '{other}' (see --help)")),
         }
         i += 1;
     }
 
-    Ok(Args { path, min_len, max_strings, format, encoding, output, stats })
+    Ok(Args {
+        path,
+        min_len,
+        max_strings,
+        format,
+        encoding,
+        output,
+        stats,
+        noise_threshold,
+        threads,
+    })
 }
 
 fn matches_encoding(s: &ExtractedString, filter: EncodingFilter) -> bool {
@@ -273,14 +335,84 @@ fn write_output(strings: &[ExtractedString], format: Format, w: &mut dyn Write) 
     Ok(())
 }
 
+/// Prompt the user on stderr and read one line of reply from stdin.
+/// Returns `None` if either stream can't be read (never called unless both
+/// are already confirmed to be real terminals).
+fn prompt(question: &str) -> Option<String> {
+    eprint!("{question} ");
+    io::stderr().flush().ok()?;
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line).ok()?;
+    Some(line.trim().to_string())
+}
+
+/// After printing filtered results to stdout, ask whether the user also
+/// wants them saved to a file (`y`/`N`, default no). Only called when both
+/// stdin and stdout are real terminals -- a script piping `ratdmp`'s
+/// output (`ratdmp x.dmp | grep ...`) never gets an unexpected prompt.
+fn maybe_prompt_save(strings: &[ExtractedString], format: Format) {
+    let answer = match prompt("Save filtered results to a file? [y/N]") {
+        Some(a) => a.to_lowercase(),
+        None => return,
+    };
+    if answer != "y" && answer != "yes" {
+        return;
+    }
+
+    let path = match prompt("Output file path:") {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            eprintln!("no path given, skipping save");
+            return;
+        }
+    };
+
+    match File::create(&path) {
+        Ok(file) => {
+            let mut w = BufWriter::new(file);
+            match write_output(strings, format, &mut w) {
+                Ok(()) => eprintln!("wrote {} strings to '{path}'", strings.len()),
+                Err(e) => eprintln!("error writing output: {e}"),
+            }
+        }
+        Err(e) => eprintln!("could not create output '{path}': {e}"),
+    }
+}
+
 fn run() -> Result<(), String> {
     let args = parse_args()?;
 
     let file_size = std::fs::metadata(&args.path).map(|m| m.len()).unwrap_or(0);
     let start = Instant::now();
 
-    let strings = extract_strings_from_file(&args.path, args.min_len, args.max_strings)
-        .map_err(|e| format!("could not read '{}': {e}", args.path))?;
+    let noise_cfg = match args.noise_threshold {
+        Some(t) => NoiseConfig::from_threshold(t),
+        None => NoiseConfig::default(),
+    };
+
+    let strings = if args.threads > 1 {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(args.threads)
+            .build()
+            .map_err(|e| format!("could not set up {}-thread pool: {e}", args.threads))?;
+        pool.install(|| {
+            extract_strings_from_file_parallel(
+                &args.path,
+                args.min_len,
+                args.max_strings,
+                noise_cfg,
+            )
+        })
+        .map_err(|e| format!("could not read '{}': {e}", args.path))?
+    } else {
+        extract_strings_from_file_with_noise_config(
+            &args.path,
+            args.min_len,
+            args.max_strings,
+            noise_cfg,
+        )
+        .map_err(|e| format!("could not read '{}': {e}", args.path))?
+    };
 
     let filtered: Vec<&ExtractedString> = strings
         .iter()
@@ -294,7 +426,11 @@ fn run() -> Result<(), String> {
     // cloning here isn't a real performance concern.
     let owned: Vec<ExtractedString> = filtered
         .into_iter()
-        .map(|s| ExtractedString { offset: s.offset, encoding: s.encoding, text: s.text.clone() })
+        .map(|s| ExtractedString {
+            offset: s.offset,
+            encoding: s.encoding,
+            text: s.text.clone(),
+        })
         .collect();
 
     // Elapsed time covers extraction + filtering, deliberately NOT the
@@ -305,26 +441,45 @@ fn run() -> Result<(), String> {
 
     match &args.output {
         Some(path) => {
-            let file = File::create(path).map_err(|e| format!("could not create output '{path}': {e}"))?;
+            let file =
+                File::create(path).map_err(|e| format!("could not create output '{path}': {e}"))?;
             let mut w = BufWriter::new(file);
-            write_output(&owned, args.format, &mut w).map_err(|e| format!("error writing output: {e}"))?;
+            write_output(&owned, args.format, &mut w)
+                .map_err(|e| format!("error writing output: {e}"))?;
             eprintln!("wrote {} strings to '{path}'", owned.len());
         }
         None => {
-            let stdout = io::stdout();
-            let mut w = BufWriter::new(stdout.lock());
-            write_output(&owned, args.format, &mut w).map_err(|e| format!("error writing stdout: {e}"))?;
+            {
+                let stdout = io::stdout();
+                let mut w = BufWriter::new(stdout.lock());
+                write_output(&owned, args.format, &mut w)
+                    .map_err(|e| format!("error writing stdout: {e}"))?;
+            }
+            // Only offer this when there's an actual human on the other end
+            // of both stdin and stdout -- piping (`ratdmp x.dmp | grep ...`)
+            // or redirecting output must stay non-interactive.
+            if io::stdin().is_terminal() && io::stdout().is_terminal() {
+                maybe_prompt_save(&owned, args.format);
+            }
         }
     }
 
     if args.stats {
         let secs = elapsed.as_secs_f64();
-        let throughput = if secs > 0.0 { (file_size as f64) / secs } else { f64::INFINITY };
+        let throughput = if secs > 0.0 {
+            (file_size as f64) / secs
+        } else {
+            f64::INFINITY
+        };
         eprintln!("--- stats ---");
+        eprintln!("threads       : {}", args.threads);
         eprintln!("file size     : {}", human_bytes(file_size));
         eprintln!("time          : {:.3} ms", elapsed.as_secs_f64() * 1000.0);
         eprintln!("throughput    : {}/s", human_bytes(throughput as u64));
-        eprintln!("strings found : {} (ascii: {ascii_count}, utf16le: {utf16_count})", owned.len());
+        eprintln!(
+            "strings found : {} (ascii: {ascii_count}, utf16le: {utf16_count})",
+            owned.len()
+        );
         match mem_stats::peak_rss_bytes() {
             Some(bytes) => eprintln!("peak RSS      : {}", human_bytes(bytes)),
             None => eprintln!("peak RSS      : n/a (not supported on this OS)"),

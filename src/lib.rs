@@ -1,7 +1,10 @@
 //! `ratdmp` -- a standalone crate (open source, dual-licensed
-//! MIT/Apache-2.0). No dependencies besides `serde` (so `ExtractedString`
-//! can be serialized) -- the caller decides how to wrap it in JSON/its own
-//! protocol if needed (this crate only returns a plain `Vec<ExtractedString>`).
+//! MIT/Apache-2.0). Depends on `serde` (so `ExtractedString` can be
+//! serialized -- the caller decides how to wrap it in JSON/its own protocol
+//! if needed, this crate only returns a plain `Vec<ExtractedString>`) and
+//! `rayon`, used only by the opt-in parallel scanning path
+//! (`extract_strings_from_file_parallel`) -- the default sequential/
+//! streaming path does not touch it.
 //!
 //! Pulls printable ASCII / UTF-16LE strings out of a raw `.dmp` memory-dump
 //! file (or any other binary file). Pure post-processing over an
@@ -50,7 +53,7 @@
 
 use serde::Serialize;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 
 /// Default `min_len` when the caller doesn't pass one -- a reasonable
 /// baseline for the `extract_strings*` functions below when the caller
@@ -59,20 +62,68 @@ pub const MIN_STRING_LEN: usize = 4;
 /// Default `max_strings` (see MIN_STRING_LEN above).
 pub const MAX_STRINGS: usize = 200_000;
 
-// Minimum length for a "single repeated character" run (period 1, e.g.
-// "aaaaaa") to be treated as byte-fill/padding noise rather than real data.
-// Set a bit higher than the default MIN_STRING_LEN (4) because short
+// Default minimum length for a "single repeated character" run (period 1,
+// e.g. "aaaaaa") to be treated as byte-fill/padding noise rather than real
+// data. Set a bit higher than the default MIN_STRING_LEN (4) because short
 // strings like "0000"/"1111" can still be real numbers (a PIN, a repeated
-// year...).
+// year...). Overridable at runtime via `NoiseConfig` / `--noise-threshold`.
 const NOISE_REPEAT1_MIN_LEN: usize = 6;
 
-// Minimum length for a "strictly alternating 2-character" run (period 2,
-// e.g. "ababab"/"\xCD\xAB\xCD\xAB...") to be treated as noise -- higher
-// than the period-1 threshold because a 2-character pattern has a slightly
-// higher chance of coincidentally matching a real string (e.g. a short
-// letter pair repeated), so more length evidence is required to be
-// confident it's a fill pattern.
+// Default minimum length for a "strictly alternating 2-character" run
+// (period 2, e.g. "ababab"/"\xCD\xAB\xCD\xAB...") to be treated as noise --
+// higher than the period-1 threshold because a 2-character pattern has a
+// slightly higher chance of coincidentally matching a real string (e.g. a
+// short letter pair repeated), so more length evidence is required to be
+// confident it's a fill pattern. Overridable at runtime, see `NoiseConfig`.
 const NOISE_REPEAT2_MIN_LEN: usize = 8;
+
+/// Runtime-configurable noise-filter thresholds (see `is_low_information_repeat`).
+/// Previously these were the hardcoded constants `NOISE_REPEAT1_MIN_LEN` /
+/// `NOISE_REPEAT2_MIN_LEN` -- now callers (including the CLI's
+/// `--noise-threshold <N>`) can tune or fully disable the filter.
+#[derive(Debug, Clone, Copy)]
+pub struct NoiseConfig {
+    /// Minimum run length for a period-1 repeat (e.g. "aaaaaa") to count as noise.
+    pub repeat1_min_len: usize,
+    /// Minimum run length for a period-2 repeat (e.g. "abab") to count as noise.
+    pub repeat2_min_len: usize,
+}
+
+impl Default for NoiseConfig {
+    fn default() -> Self {
+        Self {
+            repeat1_min_len: NOISE_REPEAT1_MIN_LEN,
+            repeat2_min_len: NOISE_REPEAT2_MIN_LEN,
+        }
+    }
+}
+
+impl NoiseConfig {
+    /// Turns the noise filter off entirely (every run is kept, however repetitive).
+    pub fn disabled() -> Self {
+        Self {
+            repeat1_min_len: usize::MAX,
+            repeat2_min_len: usize::MAX,
+        }
+    }
+
+    /// Builds a config from a single `--noise-threshold <N>`-style value:
+    /// `N` becomes the period-1 threshold, and the period-2 threshold is
+    /// `N + 2` (preserving the original gap between the two, since a
+    /// 2-character pattern needs a bit more length evidence to be confident
+    /// it's a fill pattern rather than a coincidental short real string).
+    /// `0` disables the filter entirely.
+    pub fn from_threshold(threshold: usize) -> Self {
+        if threshold == 0 {
+            Self::disabled()
+        } else {
+            Self {
+                repeat1_min_len: threshold,
+                repeat2_min_len: threshold + 2,
+            }
+        }
+    }
+}
 
 // File chunk size per read -- large enough for efficient I/O,
 // small enough to not accumulate too much RAM for the buffer.
@@ -140,6 +191,7 @@ fn is_printable(b: u8) -> bool {
 /// correct "next low byte" position (2 bytes ahead).
 struct StringRunScanner<'a> {
     min_len: usize,
+    noise_cfg: NoiseConfig,
     on_found: &'a mut dyn FnMut(ExtractedString),
 
     ascii_start: i64,
@@ -151,9 +203,14 @@ struct StringRunScanner<'a> {
 }
 
 impl<'a> StringRunScanner<'a> {
-    fn new(min_len: usize, on_found: &'a mut dyn FnMut(ExtractedString)) -> Self {
+    fn new(
+        min_len: usize,
+        noise_cfg: NoiseConfig,
+        on_found: &'a mut dyn FnMut(ExtractedString),
+    ) -> Self {
         Self {
             min_len,
+            noise_cfg,
             on_found,
             ascii_start: -1,
             ascii_buf: Vec::with_capacity(64),
@@ -171,7 +228,14 @@ impl<'a> StringRunScanner<'a> {
     /// (buffer[i+1]) without processing that byte right away, letting the
     /// caller "hold back" the last byte of a chunk as carry into the next
     /// `feed()` call.
-    fn feed(&mut self, buffer: &[u8], offset: usize, process_count: usize, buffer_valid_len: usize, global_base: u64) {
+    fn feed(
+        &mut self,
+        buffer: &[u8],
+        offset: usize,
+        process_count: usize,
+        buffer_valid_len: usize,
+        global_base: u64,
+    ) {
         let mut k = 0usize;
         while k < process_count {
             // -- Fast-skip: when NO run is currently open (neither ascii
@@ -248,7 +312,10 @@ impl<'a> StringRunScanner<'a> {
     }
 
     fn flush_ascii(&mut self) {
-        if self.ascii_start >= 0 && self.ascii_buf.len() >= self.min_len && !is_low_information_repeat(&self.ascii_buf) {
+        if self.ascii_start >= 0
+            && self.ascii_buf.len() >= self.min_len
+            && !is_low_information_repeat(&self.ascii_buf, &self.noise_cfg)
+        {
             let text = String::from_utf8_lossy(&self.ascii_buf).into_owned();
             (self.on_found)(ExtractedString {
                 offset: self.ascii_start as u64,
@@ -265,7 +332,7 @@ impl<'a> StringRunScanner<'a> {
             // u16_buf always holds values in 0..=0x7F (gated by is_printable
             // before pushing) -- the `as u8` cast is safe, no bits lost.
             let as_bytes: Vec<u8> = self.u16_buf.iter().map(|&c| c as u8).collect();
-            if !is_low_information_repeat(&as_bytes) {
+            if !is_low_information_repeat(&as_bytes, &self.noise_cfg) {
                 let text = String::from_utf16_lossy(&self.u16_buf);
                 (self.on_found)(ExtractedString {
                     offset: self.u16_start as u64,
@@ -289,23 +356,28 @@ impl<'a> StringRunScanner<'a> {
 /// and UTF-16LE lowered to its low bytes (`u16_buf` is always within
 /// 0..=0x7F since it's gated by `is_printable` before being pushed into
 /// the buffer, so the `as u8` cast loses no information).
-fn is_low_information_repeat(buf: &[u8]) -> bool {
+fn is_low_information_repeat(buf: &[u8], cfg: &NoiseConfig) -> bool {
     let n = buf.len();
     if n == 0 {
         return false;
     }
 
     // Period 1: every byte is identical to the first byte.
-    if n >= NOISE_REPEAT1_MIN_LEN && buf.iter().all(|&b| b == buf[0]) {
+    if n >= cfg.repeat1_min_len && buf.iter().all(|&b| b == buf[0]) {
         return true;
     }
 
     // Period 2: strictly alternates between 2 values (different from each
     // other -- if they were the same it would already have been caught by
     // the period-1 branch) across the whole run length.
-    if n >= NOISE_REPEAT2_MIN_LEN {
+    if n >= cfg.repeat2_min_len {
         let (p0, p1) = (buf[0], buf[1]);
-        if p0 != p1 && buf.iter().enumerate().all(|(i, &b)| b == if i % 2 == 0 { p0 } else { p1 }) {
+        if p0 != p1
+            && buf
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == if i % 2 == 0 { p0 } else { p1 })
+        {
             return true;
         }
     }
@@ -326,14 +398,26 @@ fn estimate_capacity(input_len: u64, max_strings: usize) -> usize {
 /// byte slice ALREADY in RAM. `max_strings` is an upper bound to avoid
 /// unbounded growth of memory / the JSON returned to the UI.
 pub fn extract_strings(data: &[u8], min_len: usize, max_strings: usize) -> Vec<ExtractedString> {
-    let mut results: Vec<ExtractedString> = Vec::with_capacity(estimate_capacity(data.len() as u64, max_strings));
+    extract_strings_with_noise_config(data, min_len, max_strings, NoiseConfig::default())
+}
+
+/// Same as `extract_strings`, but with a configurable noise filter (see
+/// `NoiseConfig`) instead of the hardcoded defaults.
+pub fn extract_strings_with_noise_config(
+    data: &[u8],
+    min_len: usize,
+    max_strings: usize,
+    noise_cfg: NoiseConfig,
+) -> Vec<ExtractedString> {
+    let mut results: Vec<ExtractedString> =
+        Vec::with_capacity(estimate_capacity(data.len() as u64, max_strings));
     {
         let mut on_found = |s: ExtractedString| {
             if results.len() < max_strings {
                 results.push(s);
             }
         };
-        let mut scanner = StringRunScanner::new(min_len, &mut on_found);
+        let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found);
         scanner.feed(data, 0, data.len(), data.len(), 0);
         scanner.flush_all();
     }
@@ -356,12 +440,31 @@ pub fn extract_strings(data: &[u8], min_len: usize, max_strings: usize) -> Vec<E
 /// into the next so a UTF-16LE pair straddling an I/O boundary is always
 /// tested correctly.
 pub fn extract_strings_from_reader<R: Read>(
-    mut reader: R,
+    reader: R,
     min_len: usize,
     max_strings: usize,
     estimated_len: u64,
 ) -> std::io::Result<Vec<ExtractedString>> {
-    let mut results: Vec<ExtractedString> = Vec::with_capacity(estimate_capacity(estimated_len, max_strings));
+    extract_strings_from_reader_with_noise_config(
+        reader,
+        min_len,
+        max_strings,
+        estimated_len,
+        NoiseConfig::default(),
+    )
+}
+
+/// Same as `extract_strings_from_reader`, but with a configurable noise
+/// filter (see `NoiseConfig`) instead of the hardcoded defaults.
+pub fn extract_strings_from_reader_with_noise_config<R: Read>(
+    mut reader: R,
+    min_len: usize,
+    max_strings: usize,
+    estimated_len: u64,
+    noise_cfg: NoiseConfig,
+) -> std::io::Result<Vec<ExtractedString>> {
+    let mut results: Vec<ExtractedString> =
+        Vec::with_capacity(estimate_capacity(estimated_len, max_strings));
     let count = std::cell::Cell::new(0usize); // see the borrow-checker note in extract_strings()
     {
         let mut on_found = |s: ExtractedString| {
@@ -370,7 +473,7 @@ pub fn extract_strings_from_reader<R: Read>(
                 count.set(count.get() + 1);
             }
         };
-        let mut scanner = StringRunScanner::new(min_len, &mut on_found);
+        let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found);
 
         let mut buffer = vec![0u8; CHUNK_SIZE];
         let mut global_base: u64 = 0;
@@ -380,7 +483,8 @@ pub fn extract_strings_from_reader<R: Read>(
             let to_read_into = buffer.len() - carry_len;
             let mut read_total = 0usize;
             while read_total < to_read_into {
-                let n = reader.read(&mut buffer[carry_len + read_total..carry_len + to_read_into])?;
+                let n =
+                    reader.read(&mut buffer[carry_len + read_total..carry_len + to_read_into])?;
                 if n == 0 {
                     break; // no more data (EOF)
                 }
@@ -421,14 +525,133 @@ pub fn extract_strings_from_reader<R: Read>(
 
 /// Extracts strings from a `.dmp` file, in chunks -- does NOT
 /// read the whole file into RAM.
-pub fn extract_strings_from_file(dump_path: &str, min_len: usize, max_strings: usize) -> std::io::Result<Vec<ExtractedString>> {
+pub fn extract_strings_from_file(
+    dump_path: &str,
+    min_len: usize,
+    max_strings: usize,
+) -> std::io::Result<Vec<ExtractedString>> {
+    extract_strings_from_file_with_noise_config(
+        dump_path,
+        min_len,
+        max_strings,
+        NoiseConfig::default(),
+    )
+}
+
+/// Same as `extract_strings_from_file`, but with a configurable noise
+/// filter (see `NoiseConfig`) instead of the hardcoded defaults.
+pub fn extract_strings_from_file_with_noise_config(
+    dump_path: &str,
+    min_len: usize,
+    max_strings: usize,
+    noise_cfg: NoiseConfig,
+) -> std::io::Result<Vec<ExtractedString>> {
     let file = File::open(dump_path)?;
     let estimated_len = file.metadata().map(|m| m.len()).unwrap_or(0);
     // 64KB BufReader -- a good balance between syscall overhead and memory
     // use for sequential reads; the OS read-ahead heuristics naturally
     // match this access pattern too.
     let reader = BufReader::with_capacity(1 << 16, file);
-    extract_strings_from_reader(reader, min_len, max_strings, estimated_len)
+    extract_strings_from_reader_with_noise_config(
+        reader,
+        min_len,
+        max_strings,
+        estimated_len,
+        noise_cfg,
+    )
+}
+
+// --- Parallel scanning (rayon work-stealing) --------------------------------
+//
+// The single-threaded path above is I/O-bound-friendly (streams CHUNK_SIZE
+// at a time, constant peak memory) but only uses one core for the actual
+// scanning. On a multi-core box scanning an already-fast SSD/NVMe (or a
+// dump cached by the OS page cache), the CPU-bound scan itself becomes the
+// bottleneck -- this is where splitting the work across threads helps.
+//
+// Design: split the file into fixed-size `PARALLEL_CHUNK_SIZE` regions and
+// hand each region to rayon's work-stealing pool (`par_iter`). Each worker
+// re-opens the file and seeks to its region independently (cheap: just an
+// fd + seek, no shared state/locking needed between threads). Each region
+// is read with an extra `MAX_RUN_CHARS` bytes of "overlap" past its
+// boundary -- exactly the same limit the single-threaded scanner already
+// force-flushes a run at -- so a run starting near the end of a region is
+// never truncated by the region split. A region only *keeps* strings whose
+// start offset falls inside its own `[start, logical_end)` -- the next
+// region picks up the continuation on its own, so nothing is duplicated or
+// lost at the boundary. Results are concatenated and re-sorted by offset
+// (each region's own results are already offset-sorted, but merge order
+// across regions/threads isn't guaranteed).
+const PARALLEL_CHUNK_SIZE: u64 = 64 * 1024 * 1024; // 64MB per region
+
+/// Same as `extract_strings_from_file`, but scans the file in parallel
+/// across multiple OS threads via `rayon`'s work-stealing thread pool
+/// instead of a single sequential pass. Best on multi-core machines with
+/// fast storage / a warm page cache, where the CPU-bound scan (not disk
+/// I/O) is the bottleneck. Peak memory is bounded by
+/// `num_active_threads * (PARALLEL_CHUNK_SIZE + MAX_RUN_CHARS)`, not by the
+/// file size. Use `rayon::ThreadPoolBuilder::num_threads` (or the
+/// `RAYON_NUM_THREADS` env var) to control the degree of parallelism; by
+/// default rayon uses one thread per logical CPU.
+pub fn extract_strings_from_file_parallel(
+    dump_path: &str,
+    min_len: usize,
+    max_strings: usize,
+    noise_cfg: NoiseConfig,
+) -> std::io::Result<Vec<ExtractedString>> {
+    use rayon::prelude::*;
+
+    let file_len = std::fs::metadata(dump_path)?.len();
+    if file_len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let overlap = MAX_RUN_CHARS as u64;
+    let n_chunks = ((file_len + PARALLEL_CHUNK_SIZE - 1) / PARALLEL_CHUNK_SIZE) as usize;
+
+    let chunk_results: Vec<std::io::Result<Vec<ExtractedString>>> = (0..n_chunks)
+        .into_par_iter()
+        .map(|idx| -> std::io::Result<Vec<ExtractedString>> {
+            let start = idx as u64 * PARALLEL_CHUNK_SIZE;
+            // The boundary this region "owns" -- strings starting at or
+            // past this point belong to the NEXT region, not this one.
+            let logical_end = std::cmp::min(start + PARALLEL_CHUNK_SIZE, file_len);
+            // How far past the boundary this region actually reads, purely
+            // to give a run starting right before `logical_end` room to
+            // finish (or hit its own MAX_RUN_CHARS force-flush, same as
+            // the sequential scanner would).
+            let read_end = std::cmp::min(logical_end + overlap, file_len);
+            let read_len = (read_end - start) as usize;
+
+            let mut file = File::open(dump_path)?;
+            file.seek(SeekFrom::Start(start))?;
+            let mut buf = vec![0u8; read_len];
+            file.read_exact(&mut buf)?;
+
+            let mut local: Vec<ExtractedString> = Vec::new();
+            {
+                let mut on_found = |s: ExtractedString| {
+                    if s.offset < logical_end {
+                        local.push(s);
+                    }
+                };
+                let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut on_found);
+                scanner.feed(&buf, 0, buf.len(), buf.len(), start);
+                scanner.flush_all();
+            }
+            Ok(local)
+        })
+        .collect();
+
+    let mut results = Vec::new();
+    for r in chunk_results {
+        results.extend(r?);
+    }
+    results.sort_by_key(|s| s.offset);
+    if results.len() > max_strings {
+        results.truncate(max_strings);
+    }
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -442,7 +665,9 @@ mod tests {
         // "hi" UTF-16LE
         data.extend_from_slice(&[b'h', 0x00, b'i', 0x00, 0x00, 0x00]);
         let out = extract_strings(&data, 4, 200_000);
-        assert!(out.iter().any(|s| s.encoding == "ascii" && s.text == "hello world"));
+        assert!(out
+            .iter()
+            .any(|s| s.encoding == "ascii" && s.text == "hello world"));
     }
 
     #[test]
@@ -467,7 +692,7 @@ mod tests {
         let mut results = Vec::new();
         {
             let mut on_found = |s: ExtractedString| results.push(s);
-            let mut scanner = StringRunScanner::new(4, &mut on_found);
+            let mut scanner = StringRunScanner::new(4, NoiseConfig::default(), &mut on_found);
             // Chunk 1: bytes 0..=5 (feed 5, valid_len 6) -- carry byte 6 (index 5)
             scanner.feed(&full[0..6], 0, 5, 6, 0);
             // Chunk 2 starts with the carry (full[5]) then the rest full[6..]
@@ -476,7 +701,9 @@ mod tests {
             scanner.feed(&block2, 0, block2.len(), block2.len(), 5);
             scanner.flush_all();
         }
-        assert!(results.iter().any(|s| s.encoding == "utf16le" && s.text == "abcd"));
+        assert!(results
+            .iter()
+            .any(|s| s.encoding == "utf16le" && s.text == "abcd"));
     }
 
     #[test]
@@ -486,7 +713,9 @@ mod tests {
             data.extend_from_slice(format!("token_{i:04}_", i = i).as_bytes());
         }
         let expected = extract_strings(&data, 4, 200_000);
-        let via_reader = extract_strings_from_reader(std::io::Cursor::new(&data), 4, 200_000, data.len() as u64).unwrap();
+        let via_reader =
+            extract_strings_from_reader(std::io::Cursor::new(&data), 4, 200_000, data.len() as u64)
+                .unwrap();
         assert_eq!(expected.len(), via_reader.len());
         assert_eq!(expected[0].text, via_reader[0].text);
     }
@@ -519,6 +748,54 @@ mod tests {
     }
 
     #[test]
+    fn custom_noise_threshold_from_cli_style_value() {
+        // With threshold=16, an 8-char repeat like "aaaaaaaa" is now BELOW
+        // the (raised) noise threshold, so it must be kept.
+        let cfg = NoiseConfig::from_threshold(16);
+        let data = b"\x00aaaaaaaa\x00".to_vec();
+        let out = extract_strings_with_noise_config(&data, 4, 200_000, cfg);
+        assert!(out.iter().any(|s| s.text == "aaaaaaaa"));
+    }
+
+    #[test]
+    fn noise_threshold_zero_disables_filter_entirely() {
+        let cfg = NoiseConfig::from_threshold(0);
+        let data = b"\x00aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x00".to_vec();
+        let out = extract_strings_with_noise_config(&data, 4, 200_000, cfg);
+        assert!(out.iter().any(|s| s.text.starts_with("aaaa")));
+    }
+
+    #[test]
+    fn parallel_matches_sequential_on_multi_region_data() {
+        // Build data spanning several PARALLEL_CHUNK_SIZE-sized regions so
+        // the parallel path actually exercises >1 chunk / boundary
+        // handling, and check it agrees with the sequential scanner.
+        let mut data = Vec::new();
+        for i in 0..3000u32 {
+            data.extend_from_slice(format!("marker_{i:05}_value_", i = i).as_bytes());
+        }
+        let tmp = std::env::temp_dir().join(format!("ratdmp_test_{}.bin", std::process::id()));
+        std::fs::write(&tmp, &data).unwrap();
+
+        let sequential = extract_strings(&data, 4, 200_000);
+        let parallel = extract_strings_from_file_parallel(
+            tmp.to_str().unwrap(),
+            4,
+            200_000,
+            NoiseConfig::default(),
+        )
+        .unwrap();
+
+        std::fs::remove_file(&tmp).ok();
+
+        assert_eq!(sequential.len(), parallel.len());
+        for (a, b) in sequential.iter().zip(parallel.iter()) {
+            assert_eq!(a.offset, b.offset);
+            assert_eq!(a.text, b.text);
+        }
+    }
+
+    #[test]
     fn real_looking_string_not_filtered() {
         let data = b"\x00password123\x00".to_vec();
         let out = extract_strings(&data, 4, 200_000);
@@ -536,6 +813,8 @@ mod tests {
         }
         data.extend_from_slice(&[0x00, 0x00]);
         let out = extract_strings(&data, 4, 200_000);
-        assert!(!out.iter().any(|s| s.encoding == "utf16le" && s.text == "aaaaaaaa"));
+        assert!(!out
+            .iter()
+            .any(|s| s.encoding == "utf16le" && s.text == "aaaaaaaa"));
     }
 }

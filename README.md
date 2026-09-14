@@ -54,9 +54,15 @@ derives `serde::Serialize` if you want to hand it off as JSON.
 
 ## CLI
 
-The crate also ships a `ratdmp` binary — no extra dependencies (no clap,
-no serde_json; arg parsing and JSON output are both hand-rolled to keep
-the crate's "one dependency" philosophy):
+The crate also ships a `ratdmp` binary — arg parsing and JSON output are
+hand-rolled (no clap, no serde_json).
+
+**Pre-built binaries:** grab the latest `.exe`/binary for Linux, Windows,
+or macOS (x86_64 + Apple Silicon) from the [Releases
+page](https://github.com/N0moreher0/ratdmp/releases) — no Rust toolchain
+needed. Every release also ships a `SHA256SUMS` file to verify the download.
+
+Or build/install from source:
 
 ```bash
 cargo install ratdmp
@@ -64,6 +70,8 @@ cargo install ratdmp
 ratdmp lsass.dmp
 ratdmp lsass.dmp --min-len 6 --format json -o strings.json
 ratdmp lsass.dmp --encoding utf16 --max-strings 5000
+ratdmp lsass.dmp --noise-threshold 16
+ratdmp lsass.dmp --threads 8 --stats
 ratdmp --help
 ```
 
@@ -73,6 +81,21 @@ Options: `--min-len <N>`, `--max-strings <N>`, `--format <text|json>`,
 never mixes into piped stdout output).
 Text format is `offset\tencoding\ttext` per line; JSON format is a plain
 array of `{"offset":...,"encoding":...,"text":...}`.
+
+**`--noise-threshold <N>`** — configures the byte-fill/heap-fill noise
+filter instead of the hardcoded defaults (period-1 repeats like `aaaa`
+need length `N`, period-2 repeats like `abab` need `N+2`). `0` disables
+the filter entirely, so nothing gets dropped. Library callers get the same
+control via `NoiseConfig` and the `*_with_noise_config` functions.
+
+**`--threads <N>`** — scans using an N-worker `rayon` work-stealing pool
+instead of the default single-threaded streaming scan. `1` (default) is
+the original sequential/streaming path: constant peak memory regardless of
+file size, best for very large dumps or slow disks. `>1` splits the file
+into 64MB regions scanned in parallel, which is faster on multi-core
+machines once the CPU-bound scan itself (not disk I/O) becomes the
+bottleneck — e.g. a warm page cache or fast NVMe. Library callers can use
+`extract_strings_from_file_parallel` directly.
 
 `--stats` output looks like this (all read straight from the OS, no extra
 dependency):
