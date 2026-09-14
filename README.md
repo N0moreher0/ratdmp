@@ -12,17 +12,52 @@
              Fast, composable memory-dump extraction
 ```
 
-> **A focused Rust library for building your own DFIR and malware-analysis
-> tooling.**
+> **A fast Rust core library plus a ready-to-use CLI for DFIR and
+> malware-analysis workflows.**
 
 [![Crates.io](https://img.shields.io/crates/v/ratdmp?logo=rust)](https://crates.io/crates/ratdmp)
 [![Documentation](https://img.shields.io/docsrs/ratdmp?logo=docs.rs)](https://docs.rs/ratdmp)
 [![License](https://img.shields.io/crates/l/ratdmp)](https://github.com/N0moreher0/ratdmp)
 
-`ratdmp` is a library-first, streaming ASCII/UTF-16LE string extractor for
-raw memory dumps and other binary payloads. It provides the extraction engine,
-noise filtering, bounded parallel scanning, and serializable results; your
-application owns the UI, IOC rules, storage, alerting, and reporting.
+This repository contains two layers:
+
+- **`ratdmp`** — the library crate published on
+  [crates.io](https://crates.io/crates/ratdmp), containing the extraction
+  engine, noise filtering, bounded parallel scanning, and serializable
+  results.
+- **`ratdmp-cli`** — the optional command-line frontend in [`cli/`](./cli/),
+  published separately with a RATDMP banner, automatic reports, JSON/text
+  output, encoding filters, triage signals, and hardware-aware scanning.
+
+Use the Rust API directly for custom applications, or install the finished
+CLI when you want an immediate command-line workflow.
+
+## Install the CLI and use it
+
+Install once; Cargo downloads the CLI and core library, builds an optimized
+`ratdmp` executable, and places it on your Cargo binary path:
+
+```powershell
+cargo install ratdmp-cli
+```
+
+Then scan immediately:
+
+```powershell
+ratdmp memory.dmp --auto-tune
+```
+
+Update an existing installation:
+
+```powershell
+cargo install ratdmp-cli --force
+```
+
+See all available options:
+
+```powershell
+ratdmp --help
+```
 
 ## Why ratdmp?
 
@@ -39,8 +74,8 @@ padding bytes. `ratdmp` gives applications a predictable core:
 - **Parallel when useful**: opt into bounded region-based scanning with Rayon.
 - **Composable output**: receive sorted `ExtractedString` values and decide
   how your application classifies, displays, or stores them.
-- **Library-only crate**: no bundled CLI, terminal policy, IOC assumptions, or
-  output format imposed on downstream users.
+- **Separate frontend**: the core stays composable while `ratdmp-cli` offers
+  a complete terminal workflow for users who want one.
 
 ## Installation
 
@@ -57,6 +92,9 @@ cargo add ratdmp
 
 The crate exposes a Rust API only. Build your own CLI, service, desktop
 application, forensic pipeline, or scripting integration around it.
+
+For the ready-made frontend, inspect [`cli/src/main.rs`](./cli/src/main.rs)
+or install it with `cargo install ratdmp-cli`.
 
 ## Quick start
 
@@ -143,6 +181,36 @@ decide what is malicious. That is intentional: downstream applications can
 layer their own regexes, YARA rules, enrichment, confidence scoring, privacy
 handling, and reporting without fighting a bundled CLI policy.
 
+## CLI frontend in this repository
+
+The GitHub repository includes the complete CLI source under [`cli/`](./cli/).
+It is a separate package so the core library remains reusable:
+
+```text
+ratdmp/
+├── src/lib.rs          # ratdmp core library
+├── cli/
+│   ├── Cargo.toml      # ratdmp-cli package
+│   └── src/main.rs     # ratdmp executable
+├── Cargo.toml          # ratdmp core package
+└── README.md           # repository guide
+```
+
+The CLI adds:
+
+- `--format text|json`
+- `--encoding all|ascii|utf16`
+- `--min-len` and `--max-strings`
+- `--noise-threshold`
+- `--threads` and `--auto-tune`
+- `-o/--output`
+- automatic scan reports and priority triage signals on `stderr`
+
+Results stay clean on `stdout`, so the CLI works both interactively and in
+shell pipelines. The priority signals are practical investigation hints for
+common credential, token, secret, URL, network, and email patterns; they are
+not a verdict that a value is valid, active, or malicious.
+
 ## Streaming and parallel scanning
 
 The normal file and reader APIs use bounded streaming memory. They are a good
@@ -169,7 +237,7 @@ The parallel API divides the input into fixed regions, preserves offsets, and
 returns results in sorted order. Configure Rayon's thread pool in your
 application when you need an explicit CPU/RAM policy.
 
-## Building an application around ratdmp
+## Building an application around the core
 
 The crate deliberately leaves these product decisions to you:
 
@@ -181,8 +249,8 @@ The crate deliberately leaves these product decisions to you:
 - redaction, access control, and retention
 - YARA, regex, entropy, or threat-intelligence enrichment
 
-This makes the core suitable for both a minimal `strings`-style utility and a
-full forensic pipeline.
+This makes the core suitable for both the included CLI and a custom
+`strings`-style utility or full forensic pipeline.
 
 ## Performance characteristics
 
