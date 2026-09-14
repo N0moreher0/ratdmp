@@ -1,9 +1,25 @@
 # ratdmp
 
+```text
+                 _ __ ___   __| |_ __ ___  _ __
+                | '_ ` _ \ / _` | '__/ _ \| '_ \
+                | | | | | | (_| | | | (_) | |_) |
+                |_| |_| |_|\__,_|_|  \___/| .__/
+                                          |_|
+
+        Fast memory-dump string triage for DFIR and malware analysis
+```
+
+> **Extract fast. Triage immediately. Keep stdout automation-friendly.**
+
+[![Crates.io](https://img.shields.io/crates/v/ratdmp?logo=rust)](https://crates.io/crates/ratdmp)
+[![Documentation](https://img.shields.io/docsrs/ratdmp?logo=docs.rs)](https://docs.rs/ratdmp)
+[![License](https://img.shields.io/crates/l/ratdmp)](https://github.com/N0moreher0/ratdmp)
+
 Fast, streaming ASCII / UTF-16LE string extractor for raw memory dump
 (`.dmp`) files — with simple, conservative noise filtering for
-byte-fill / heap-fill patterns. Written for malware analysis / DFIR /
-memory-forensics workflows.
+byte-fill / heap-fill patterns and built-in IOC-oriented triage. Written for
+malware analysis, DFIR, and memory-forensics workflows.
 
 ## Why
 
@@ -28,6 +44,25 @@ care about.
   data (PINs, years, etc.) — the filter only removes patterns long
   enough to be confidently noise, never sacrificing recall for short
   strings.
+- **Built-in triage signals.** The CLI surfaces likely credentials, tokens,
+  secrets, URLs, network indicators, and email addresses in a highlighted
+  priority section while preserving every extracted result in stdout.
+- **Terminal-first UX.** A polished banner, scan status, grouped length
+  summary, throughput, peak memory, and priority findings are printed to
+  `stderr`; text and JSON results remain safe for scripts and pipelines.
+
+## At a glance
+
+| Capability | Details |
+| --- | --- |
+| Input | Raw `.dmp` files or any binary payload |
+| Encodings | ASCII and UTF-16LE in one scan |
+| Processing | Streaming by default; bounded parallel regions available |
+| Noise filter | Conservative period-1 and period-2 fill-pattern detection |
+| Triage | Credential/token/secret, URL, network, and email indicators |
+| Output | Human-readable text or machine-readable JSON |
+| Scale | Hardware-aware `--auto-tune` with CPU/RAM safety limits |
+| Dependencies | No CLI framework or JSON runtime dependency |
 
 ## Usage
 
@@ -71,8 +106,8 @@ ratdmp lsass.dmp
 ratdmp lsass.dmp --min-len 6 --format json -o strings.json
 ratdmp lsass.dmp --encoding utf16 --max-strings 5000
 ratdmp lsass.dmp --noise-threshold 16
-ratdmp lsass.dmp --threads 8 --stats
-ratdmp lsass.dmp --auto-tune --stats
+ratdmp lsass.dmp --threads 8
+ratdmp lsass.dmp --auto-tune
 ratdmp --help
 ```
 
@@ -81,6 +116,22 @@ Options: `--min-len <N>`, `--max-strings <N>`, `--format <text|json>`,
 `--stats` (legacy no-op; the report is now automatic).
 Text format is `offset\tencoding\ttext` per line; JSON format is a plain
 array of `{"offset":...,"encoding":...,"text":...}`.
+
+### Recommended workflows
+
+```bash
+# Fast interactive triage; UI and priority findings go to stderr.
+ratdmp memory.dmp --auto-tune
+
+# Clean text stream for grep, awk, or another forensic tool.
+ratdmp memory.dmp --auto-tune 2>scan-report.txt | grep -Ei 'token|secret|http'
+
+# Stable JSON artifact for automation.
+ratdmp memory.dmp --format json --auto-tune -o strings.json 2>scan-report.txt
+
+# Focus on UTF-16LE strings and retain a larger result set.
+ratdmp memory.dmp --encoding utf16 --max-strings 500000 -o utf16.txt
+```
 
 ### Terminal UI and automatic report
 
@@ -116,7 +167,8 @@ indicators, and email addresses are listed separately and highlighted with
 ANSI color when stderr is a terminal. Color is disabled automatically when
 output is redirected. The UI never writes ANSI escape sequences to redirected
 output and never contaminates stdout, making it suitable for shell pipelines
-and automation.
+and automation. These are triage signals, not proof that a string is valid,
+active, or malicious; validate findings in their surrounding memory context.
 
 **`--noise-threshold <N>`** — configures the byte-fill/heap-fill noise
 filter instead of the hardcoded defaults (period-1 repeats like `aaaa`
@@ -152,31 +204,35 @@ The automatic report reads timing and memory directly from the OS (without an
 extra dependency):
 
 ```
---- stats ---
-file size     : 64.00 MiB
-time          : 200.209 ms
-throughput    : 319.68 MiB/s
-strings found : 262 (ascii: 262, utf16le: 0)
-peak RSS      : 34.12 MiB
+  [OK] scan complete
++-------------------- summary -----------------------------+
+  results      : 262
+  length       : 41 short | 136 medium | 85 long
+  threads      : 8
+  file size    : 64.00 MiB
+  elapsed      : 200.209 ms
+  throughput   : 319.68 MiB/s
+  peak memory  : 34.12 MiB
++------------------------------------------------------------+
 ```
 
 `peak RSS` is read from `/proc/self/status` (Linux) or
 `GetProcessMemoryInfo` (Windows, via raw FFI) -- it prints `n/a` on other
 platforms rather than guessing.
 
-## What this crate does *not* do
+## Scope and boundaries
 
 - No `.dmp`/MDMP structural parsing (no stream/module/thread table
   lookups) — it treats the file as a raw byte payload and scans the
   whole thing. This is intentional: it makes the extractor independent
   of the specific minidump format version or which tool produced it.
-- No IOC classification (URLs, IPs, wallet addresses, etc.) — this
-  crate's only job is turning bytes into candidate strings. Feed its
-  output into whatever classifier fits your pipeline.
-- No entropy-based or statistical filtering beyond the two explicit
-  repeat patterns described above — the goal is to reject only what's
-  unambiguously noise, not to be a general-purpose deduplication or
-  scoring engine.
+- The CLI provides lightweight IOC-oriented triage signals for common
+  credential, token, secret, URL, network, and email patterns. It does not
+  claim that a highlighted string is valid, active, or malicious.
+- No aggressive entropy-based suppression or broad deduplication is applied.
+  The default favors evidence preservation; use `--noise-threshold`,
+  `--min-len`, `--encoding`, and `--max-strings` to tune collection for a
+  specific investigation.
 
 ## Minimum supported Rust version
 
