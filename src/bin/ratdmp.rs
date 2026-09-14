@@ -5,7 +5,7 @@
 //! No extra dependencies added (no clap) — keeps the `ratdmp` crate's
 //! philosophy of exactly one dependency (`serde`, for `ExtractedString`'s
 //! derive Serialize). Arg parsing is hand-rolled, and JSON output is
-//! hand-written too (no `serde_json`). The optional `--stats` block (wall
+//! hand-written too (no `serde_json`). The automatic stderr report (wall
 //! time, throughput, peak RSS) is implemented the same way: peak memory is
 //! read straight from the OS (`/proc/self/status` on Linux,
 //! `GetProcessMemoryInfo` on Windows via raw FFI) instead of pulling in a
@@ -92,7 +92,7 @@ mod mem_stats {
     }
 }
 
-/// Human-friendly byte formatting for the `--stats` block (KiB/MiB/GiB).
+/// Human-friendly byte formatting for the automatic report (KiB/MiB/GiB).
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut val = bytes as f64;
@@ -147,7 +147,7 @@ OPTIONS:
     --encoding <all|ascii|utf16>
                           Filter by encoding (default all)
     -o, --output <path>  Write to a file instead of stdout
-    --stats               Print timing/throughput/peak-RSS stats to stderr
+    --stats               Legacy no-op; reports are now always printed to stderr
     --noise-threshold <N> Min run length for the byte-fill/heap-fill noise
                           filter (period-1 repeats use N, period-2 use N+2).
                           0 disables the filter entirely. (default: 6)
@@ -172,10 +172,10 @@ EXAMPLES:
     ratdmp lsass.dmp
     ratdmp lsass.dmp --min-len 6 --format json -o strings.json
     ratdmp lsass.dmp --encoding utf16 --max-strings 5000
-    ratdmp lsass.dmp --stats -o strings.txt
+    ratdmp lsass.dmp -o strings.txt
     ratdmp lsass.dmp --noise-threshold 16
-    ratdmp lsass.dmp --threads 8 --stats
-    ratdmp lsass.dmp --auto-tune --stats
+    ratdmp lsass.dmp --threads 8
+    ratdmp lsass.dmp --auto-tune
 ";
 
 mod auto_tune {
@@ -462,6 +462,116 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+fn importance_reason(text: &str) -> Option<&'static str> {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("password")
+        || lower.contains("passwd")
+        || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("apikey")
+        || lower.contains("api_key")
+        || lower.contains("jwt")
+    {
+        Some("credential")
+    } else if lower.contains("http://") || lower.contains("https://") {
+        Some("url")
+    } else if lower.contains("c2") || lower.contains("gate.php") {
+        Some("network")
+    } else if lower.contains('@') {
+        Some("email")
+    } else {
+        None
+    }
+}
+
+fn print_intro(path: &str, file_size: u64, format: Format) {
+    if !io::stderr().is_terminal() {
+        return;
+    }
+    eprintln!("\x1b[1;36m ratdmp \x1b[0m \x1b[2mfast memory-dump string triage\x1b[0m");
+    eprintln!(
+        "\x1b[2m scanning \x1b[0m{}\x1b[2m ({}, {})\x1b[0m",
+        path,
+        human_bytes(file_size),
+        match format {
+            Format::Text => "text",
+            Format::Json => "json",
+        }
+    );
+    eprintln!();
+}
+
+fn print_report(
+    strings: &[ExtractedString],
+    file_size: u64,
+    elapsed: std::time::Duration,
+    threads: usize,
+) {
+    let color = io::stderr().is_terminal();
+    let mut short = 0usize;
+    let mut medium = 0usize;
+    let mut long = 0usize;
+    let mut important = Vec::new();
+    for string in strings {
+        match string.text.chars().count() {
+            0..=7 => short += 1,
+            8..=31 => medium += 1,
+            _ => long += 1,
+        }
+        if importance_reason(&string.text).is_some() && important.len() < 12 {
+            important.push(string);
+        }
+    }
+
+    let secs = elapsed.as_secs_f64();
+    let throughput = if secs > 0.0 {
+        (file_size as f64) / secs
+    } else {
+        f64::INFINITY
+    };
+    if color {
+        eprintln!("\x1b[1;35m--- scan report ---\x1b[0m");
+    } else {
+        eprintln!("--- scan report ---");
+    }
+    eprintln!(
+        "results       : {} (short: {}, medium: {}, long: {})",
+        strings.len(),
+        short,
+        medium,
+        long
+    );
+    eprintln!("threads       : {threads}");
+    eprintln!("file size     : {}", human_bytes(file_size));
+    eprintln!("time          : {:.3} ms", elapsed.as_secs_f64() * 1000.0);
+    eprintln!("throughput    : {}/s", human_bytes(throughput as u64));
+    match mem_stats::peak_rss_bytes() {
+        Some(bytes) => eprintln!("peak RSS      : {}", human_bytes(bytes)),
+        None => eprintln!("peak RSS      : n/a (not supported on this OS)"),
+    }
+    if !important.is_empty() {
+        if color {
+            eprintln!("\x1b[1;33mimportant findings (up to 12):\x1b[0m");
+        } else {
+            eprintln!("important findings (up to 12):");
+        }
+        for string in important {
+            let reason = importance_reason(&string.text).unwrap_or("interesting");
+            if color {
+                eprintln!(
+                    "  \x1b[1;31m[{reason}]\x1b[0m {:#010x} {} {}",
+                    string.offset, string.encoding, string.text
+                );
+            } else {
+                eprintln!(
+                    "  [{reason}] {:#010x} {} {}",
+                    string.offset, string.encoding, string.text
+                );
+            }
+        }
+    }
+}
+
 fn write_output(strings: &[ExtractedString], format: Format, w: &mut dyn Write) -> io::Result<()> {
     match format {
         Format::Text => {
@@ -536,6 +646,7 @@ fn run() -> Result<(), String> {
 
     let file_size = std::fs::metadata(&args.path).map(|m| m.len()).unwrap_or(0);
     let start = Instant::now();
+    print_intro(&args.path, file_size, args.format);
 
     let noise_cfg = match args.noise_threshold {
         Some(t) => NoiseConfig::from_threshold(t),
@@ -583,8 +694,6 @@ fn run() -> Result<(), String> {
         .iter()
         .filter(|s| matches_encoding(s, args.encoding))
         .collect();
-    let ascii_count = filtered.iter().filter(|s| s.encoding == "ascii").count();
-    let utf16_count = filtered.len() - ascii_count;
     // Clone into an owned Vec<ExtractedString> so write_output can be
     // reused as-is, rather than writing two versions (filter Vec<&T> vs
     // Vec<T>) -- the string count is already capped by max_strings, so
@@ -629,27 +738,10 @@ fn run() -> Result<(), String> {
         }
     }
 
-    if args.stats {
-        let secs = elapsed.as_secs_f64();
-        let throughput = if secs > 0.0 {
-            (file_size as f64) / secs
-        } else {
-            f64::INFINITY
-        };
-        eprintln!("--- stats ---");
-        eprintln!("threads       : {}", effective_threads);
-        eprintln!("file size     : {}", human_bytes(file_size));
-        eprintln!("time          : {:.3} ms", elapsed.as_secs_f64() * 1000.0);
-        eprintln!("throughput    : {}/s", human_bytes(throughput as u64));
-        eprintln!(
-            "strings found : {} (ascii: {ascii_count}, utf16le: {utf16_count})",
-            owned.len()
-        );
-        match mem_stats::peak_rss_bytes() {
-            Some(bytes) => eprintln!("peak RSS      : {}", human_bytes(bytes)),
-            None => eprintln!("peak RSS      : n/a (not supported on this OS)"),
-        }
-    }
+    // Reports are always printed to stderr. `--stats` remains accepted as a
+    // backwards-compatible no-op, while stdout stays safe for pipelines.
+    let _ = args.stats;
+    print_report(&owned, file_size, elapsed, effective_threads);
 
     Ok(())
 }

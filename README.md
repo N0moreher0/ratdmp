@@ -78,10 +78,31 @@ ratdmp --help
 
 Options: `--min-len <N>`, `--max-strings <N>`, `--format <text|json>`,
 `--encoding <all|ascii|utf16>`, `-o/--output <path>` (defaults to stdout),
-`--stats` (prints a timing/throughput/peak-RSS summary to stderr, so it
-never mixes into piped stdout output).
+`--stats` (legacy no-op; the report is now automatic).
 Text format is `offset\tencoding\ttext` per line; JSON format is a plain
 array of `{"offset":...,"encoding":...,"text":...}`.
+
+### Terminal UI and automatic report
+
+When running interactively, ratdmp shows a compact banner before scanning and
+prints a report after every scan. The report is always written to `stderr`, so
+stdout remains clean for pipes, redirected text, and JSON parsers:
+
+```text
+--- scan report ---
+results       : 15 (short: 3, medium: 5, long: 7)
+threads       : 1
+file size     : 5.42 KiB
+time          : 9.820 ms
+throughput    : 551.45 KiB/s
+peak RSS      : 35.77 MiB
+```
+
+Results are grouped by text length (`short` 4-7, `medium` 8-31, `long` 32+).
+Likely high-value strings such as credentials, tokens, secrets, URLs, network
+indicators, and email addresses are listed separately and highlighted with
+ANSI color when stderr is a terminal. Color is disabled automatically when
+output is redirected.
 
 **`--noise-threshold <N>`** — configures the byte-fill/heap-fill noise
 filter instead of the hardcoded defaults (period-1 repeats like `aaaa`
@@ -113,8 +134,8 @@ and result limits remain unchanged. An explicit `--threads N` always takes
 precedence; use it only when you deliberately want to override the safety
 policy.
 
-`--stats` output looks like this (all read straight from the OS, no extra
-dependency):
+The automatic report reads timing and memory directly from the OS (without an
+extra dependency):
 
 ```
 --- stats ---
