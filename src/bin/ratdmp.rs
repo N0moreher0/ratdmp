@@ -118,6 +118,7 @@ struct Args {
     stats: bool,
     noise_threshold: Option<usize>,
     threads: usize,
+    auto_tune: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -156,6 +157,9 @@ OPTIONS:
                           peak memory, works on files of any size). >1 =
                           parallel scan, faster on multi-core machines with
                           fast storage / a warm page cache.
+    --auto-tune            Choose a safe, high-throughput thread count from
+                          CPU count, available memory, and input size. Explicit
+                          --threads still takes precedence.
     -h, --help            Print this help
 
 NOTE:
@@ -171,7 +175,89 @@ EXAMPLES:
     ratdmp lsass.dmp --stats -o strings.txt
     ratdmp lsass.dmp --noise-threshold 16
     ratdmp lsass.dmp --threads 8 --stats
+    ratdmp lsass.dmp --auto-tune --stats
 ";
+
+mod auto_tune {
+    /// Returns available memory in bytes when the operating system exposes it
+    /// without requiring another dependency.
+    pub fn available_memory_bytes() -> Option<u64> {
+        #[cfg(target_os = "windows")]
+        {
+            #[repr(C)]
+            struct MemoryStatus {
+                length: u32,
+                memory_load: u32,
+                total_phys: u64,
+                avail_phys: u64,
+                total_page_file: u64,
+                avail_page_file: u64,
+                total_virtual: u64,
+                avail_virtual: u64,
+                avail_extended_virtual: u64,
+            }
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GlobalMemoryStatusEx(status: *mut MemoryStatus) -> i32;
+            }
+            unsafe {
+                let mut status = MemoryStatus {
+                    length: std::mem::size_of::<MemoryStatus>() as u32,
+                    memory_load: 0,
+                    total_phys: 0,
+                    avail_phys: 0,
+                    total_page_file: 0,
+                    avail_page_file: 0,
+                    total_virtual: 0,
+                    avail_virtual: 0,
+                    avail_extended_virtual: 0,
+                };
+                if GlobalMemoryStatusEx(&mut status) != 0 {
+                    return Some(status.avail_phys);
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+            for line in meminfo.lines() {
+                if let Some(value) = line.strip_prefix("MemAvailable:") {
+                    let kib = value
+                        .trim()
+                        .strip_suffix("kB")?
+                        .trim()
+                        .parse::<u64>()
+                        .ok()?;
+                    return Some(kib * 1024);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Tune parallelism only. Extraction thresholds and output settings are
+    /// intentionally unchanged so auto-tuning cannot silently lose evidence.
+    pub fn choose_threads(file_size: u64, requested: usize) -> usize {
+        if requested != 1 {
+            return requested;
+        }
+
+        let logical_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let chunks = ((file_size + (64 * 1024 * 1024) - 1) / (64 * 1024 * 1024)) as usize;
+        if chunks <= 1 {
+            return 1;
+        }
+
+        let memory_limit = available_memory_bytes()
+            .map(|bytes| std::cmp::max(1, (bytes / (80 * 1024 * 1024)) as usize))
+            .unwrap_or(logical_cpus);
+        std::cmp::min(logical_cpus, std::cmp::min(chunks, memory_limit))
+    }
+}
 
 fn parse_args() -> Result<Args, String> {
     let mut raw: Vec<String> = std::env::args().skip(1).collect();
@@ -196,6 +282,8 @@ fn parse_args() -> Result<Args, String> {
     let mut stats = false;
     let mut noise_threshold: Option<usize> = None;
     let mut threads: usize = 1;
+    let mut threads_explicit = false;
+    let mut auto_tune = false;
 
     let mut i = 0usize;
     while i < raw.len() {
@@ -256,6 +344,7 @@ fn parse_args() -> Result<Args, String> {
                 noise_threshold = Some(parsed);
             }
             "--threads" => {
+                threads_explicit = true;
                 let v = next_val!();
                 threads = v
                     .parse::<usize>()
@@ -263,6 +352,9 @@ fn parse_args() -> Result<Args, String> {
                 if threads == 0 {
                     return Err("--threads must be at least 1".to_string());
                 }
+            }
+            "--auto-tune" => {
+                auto_tune = true;
             }
             other => return Err(format!("unrecognized arg: '{other}' (see --help)")),
         }
@@ -279,6 +371,7 @@ fn parse_args() -> Result<Args, String> {
         stats,
         noise_threshold,
         threads,
+        auto_tune: auto_tune && !threads_explicit,
     })
 }
 
@@ -389,12 +482,25 @@ fn run() -> Result<(), String> {
         Some(t) => NoiseConfig::from_threshold(t),
         None => NoiseConfig::default(),
     };
+    let effective_threads = if args.auto_tune {
+        auto_tune::choose_threads(file_size, args.threads)
+    } else {
+        args.threads
+    };
+    if args.auto_tune {
+        eprintln!(
+            "auto-tune: selected {} thread{} for {} input",
+            effective_threads,
+            if effective_threads == 1 { "" } else { "s" },
+            human_bytes(file_size)
+        );
+    }
 
-    let strings = if args.threads > 1 {
+    let strings = if effective_threads > 1 {
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(args.threads)
+            .num_threads(effective_threads)
             .build()
-            .map_err(|e| format!("could not set up {}-thread pool: {e}", args.threads))?;
+            .map_err(|e| format!("could not set up {}-thread pool: {e}", effective_threads))?;
         pool.install(|| {
             extract_strings_from_file_parallel(
                 &args.path,
@@ -472,7 +578,7 @@ fn run() -> Result<(), String> {
             f64::INFINITY
         };
         eprintln!("--- stats ---");
-        eprintln!("threads       : {}", args.threads);
+        eprintln!("threads       : {}", effective_threads);
         eprintln!("file size     : {}", human_bytes(file_size));
         eprintln!("time          : {:.3} ms", elapsed.as_secs_f64() * 1000.0);
         eprintln!("throughput    : {}/s", human_bytes(throughput as u64));

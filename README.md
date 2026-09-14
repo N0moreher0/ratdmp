@@ -72,6 +72,7 @@ ratdmp lsass.dmp --min-len 6 --format json -o strings.json
 ratdmp lsass.dmp --encoding utf16 --max-strings 5000
 ratdmp lsass.dmp --noise-threshold 16
 ratdmp lsass.dmp --threads 8 --stats
+ratdmp lsass.dmp --auto-tune --stats
 ratdmp --help
 ```
 
@@ -96,6 +97,14 @@ into 64MB regions scanned in parallel, which is faster on multi-core
 machines once the CPU-bound scan itself (not disk I/O) becomes the
 bottleneck — e.g. a warm page cache or fast NVMe. Library callers can use
 `extract_strings_from_file_parallel` directly.
+
+**`--auto-tune`** — selects the thread count automatically from the logical
+CPU count, available memory, and the number of 64 MiB regions in the input.
+Small files stay on the low-memory streaming path; large files use as many
+workers as the machine can safely support. It only tunes parallelism: string
+length, noise filtering, encoding, output format, and result limits remain
+unchanged so auto-tuning cannot silently discard evidence. An explicit
+`--threads N` always takes precedence.
 
 `--stats` output looks like this (all read straight from the OS, no extra
 dependency):
