@@ -1,7 +1,17 @@
 # ratdmp-cli
 
-Command-line frontend for the [`ratdmp`](https://crates.io/crates/ratdmp)
-library.
+```text
++------------------------------------------------------------+
+|  RRRR    AAA   TTTTT  DDDD   MMM MMM  PPPP                 |
+|  R   R  A   A    T    D   D  M M M M  P   P                |
+|  RRRR   AAAAA    T    D   D  M  M  M  PPPP                 |
+|  R  R   A   A    T    D   D  M     M  P                    |
+|  R   R  A   A    T    DDDD   M     M  P                    |
++------------------------------------------------------------+
+```
+
+Professional command-line frontend for the
+[`ratdmp`](https://crates.io/crates/ratdmp) memory-dump extraction library.
 
 ## Install
 
@@ -16,6 +26,21 @@ installs it on your Cargo binary path.
 
 ```bash
 ratdmp memory.dmp
-ratdmp memory.dmp --auto-tune --stats
+ratdmp memory.dmp --auto-tune
 ratdmp memory.dmp --format json -o strings.json
+ratdmp memory.dmp --encoding utf16 --min-len 6
+ratdmp memory.dmp --noise-threshold 16 --threads 4
 ```
+
+## Features
+
+- ASCII and UTF-16LE extraction.
+- Streaming scans for large dump files.
+- Configurable minimum length and result limits.
+- Conservative repeat-noise filtering.
+- Parallel scanning with explicit threads or `--auto-tune`.
+- Text or JSON output.
+- Automatic scan summary and priority triage signals on `stderr`.
+- Clean stdout for shell pipelines and automation.
+
+Run `ratdmp --help` for the complete option list.

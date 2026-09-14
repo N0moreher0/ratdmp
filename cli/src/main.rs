@@ -17,6 +17,7 @@ struct Args {
     min_len: usize,
     max_strings: usize,
     format: Format,
+    encoding: Encoding,
     output: Option<String>,
     noise_threshold: Option<usize>,
     threads: usize,
@@ -24,7 +25,21 @@ struct Args {
     stats: bool,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Encoding {
+    All,
+    Ascii,
+    Utf16,
+}
+
 const HELP: &str = "\
++------------------------------------------------------------+
+|  RRRR    AAA   TTTTT  DDDD   MMM MMM  PPPP                 |
+|  R   R  A   A    T    D   D  M M M M  P   P                |
+|  RRRR   AAAAA    T    D   D  M  M  M  PPPP                 |
+|  R  R   A   A    T    D   D  M     M  P                    |
+|  R   R  A   A    T    DDDD   M     M  P                    |
++------------------------------------------------------------+
 ratdmp — fast memory-dump string extraction
 
 USAGE:
@@ -34,12 +49,14 @@ OPTIONS:
     --min-len <N>        Minimum string length (default 4)
     --max-strings <N>    Maximum results (default 200000)
     --format <text|json> Output format (default text)
+    --encoding <all|ascii|utf16>
+                          Restrict output by encoding (default all)
     -o, --output <PATH>  Write results to a file
     --noise-threshold <N>
                           Repeat-noise threshold; 0 disables filtering
     --threads <N>        Parallel worker count
-    --auto-tune          Choose a conservative worker count for this machine
-    --stats              Print timing and memory statistics to stderr
+    --auto-tune          Choose a safe worker count for this machine
+    --stats              Always-on report compatibility flag
     -h, --help           Show this help
 ";
 
@@ -55,6 +72,7 @@ fn parse_args() -> Result<Args, String> {
         min_len: MIN_STRING_LEN,
         max_strings: MAX_STRINGS,
         format: Format::Text,
+        encoding: Encoding::All,
         output: None,
         noise_threshold: None,
         threads: 1,
@@ -87,7 +105,15 @@ fn parse_args() -> Result<Args, String> {
                     "text" => Format::Text,
                     "json" => Format::Json,
                     other => return Err(format!("invalid format '{other}'")),
-                }
+                };
+            }
+            "--encoding" => {
+                args.encoding = match next(&mut i)?.as_str() {
+                    "all" => Encoding::All,
+                    "ascii" => Encoding::Ascii,
+                    "utf16" => Encoding::Utf16,
+                    other => return Err(format!("invalid encoding '{other}'")),
+                };
             }
             "-o" | "--output" => args.output = Some(next(&mut i)?),
             "--noise-threshold" => {
@@ -132,6 +158,89 @@ fn json_escape(value: &str) -> String {
     out
 }
 
+fn important_reason(text: &str) -> Option<&'static str> {
+    let lower = text.to_ascii_lowercase();
+    if [
+        "password", "passwd", "token", "secret", "apikey", "api_key", "jwt",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+    {
+        Some("credential")
+    } else if lower.contains("http://") || lower.contains("https://") {
+        Some("url")
+    } else if lower.contains("c2") || lower.contains("gate.php") {
+        Some("network")
+    } else if lower.contains('@') {
+        Some("email")
+    } else {
+        None
+    }
+}
+
+fn print_banner(path: &str, size: u64, format: Format) {
+    if !io::stderr().is_terminal() {
+        return;
+    }
+    let format = match format {
+        Format::Text => "text",
+        Format::Json => "json",
+    };
+    eprintln!("\x1b[1;36m+------------------------------------------------------------+\x1b[0m");
+    eprintln!(
+        "\x1b[1;36m|  \x1b[1;37mRATDMP\x1b[1;36m  |  memory-dump string triage                  |\x1b[0m"
+    );
+    eprintln!("\x1b[1;36m+------------------------------------------------------------+\x1b[0m");
+    eprintln!("  input      : {path}");
+    eprintln!("  size/format: {size} bytes / {format}");
+    eprintln!("  \x1b[1;34m[..] scanning\x1b[0m");
+}
+
+fn print_report(results: &[ExtractedString], size: u64, elapsed: f64, threads: usize) {
+    let color = io::stderr().is_terminal();
+    let mut short = 0;
+    let mut medium = 0;
+    let mut long = 0;
+    let mut important = Vec::new();
+    for result in results {
+        match result.text.chars().count() {
+            0..=7 => short += 1,
+            8..=31 => medium += 1,
+            _ => long += 1,
+        }
+        if important_reason(&result.text).is_some() && important.len() < 12 {
+            important.push(result);
+        }
+    }
+    if color {
+        eprintln!("\x1b[1;32m  [OK] scan complete\x1b[0m");
+        eprintln!("\x1b[1;36m+-------------------- summary -----------------------------+\x1b[0m");
+    } else {
+        eprintln!("  [OK] scan complete");
+        eprintln!("+-------------------- summary -----------------------------+");
+    }
+    eprintln!("  results    : {}", results.len());
+    eprintln!("  length     : {short} short | {medium} medium | {long} long");
+    eprintln!("  threads    : {threads}");
+    eprintln!("  file size  : {size} bytes");
+    eprintln!("  elapsed    : {:.3} ms", elapsed * 1000.0);
+    eprintln!(
+        "  throughput : {:.2} MiB/s",
+        size as f64 / elapsed.max(f64::MIN_POSITIVE) / 1_048_576.0
+    );
+    eprintln!("+------------------------------------------------------------+");
+    if !important.is_empty() {
+        eprintln!("  [!] priority findings (up to 12)");
+        for result in important {
+            let reason = important_reason(&result.text).unwrap_or("interesting");
+            eprintln!(
+                "      {reason:<10} {:#010x} {:<7} {}",
+                result.offset, result.encoding, result.text
+            );
+        }
+    }
+}
+
 fn write_results(
     results: &[ExtractedString],
     format: Format,
@@ -170,13 +279,16 @@ fn main() -> Result<(), String> {
     let file_size = std::fs::metadata(&args.path)
         .map_err(|e| format!("cannot inspect '{}': {e}", args.path))?
         .len();
+    print_banner(&args.path, file_size, args.format);
     let threads = if args.auto_tune {
-        std::cmp::max(
-            1,
-            std::thread::available_parallelism()
-                .map(|n| n.get() * 3 / 4)
-                .unwrap_or(1),
-        )
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        if cpus <= 2 {
+            1
+        } else {
+            std::cmp::max(1, std::cmp::min(cpus - 1, cpus * 3 / 4))
+        }
     } else {
         args.threads
     };
@@ -202,6 +314,14 @@ fn main() -> Result<(), String> {
         )
     }
     .map_err(|e| format!("scan failed: {e}"))?;
+    let results: Vec<ExtractedString> = results
+        .into_iter()
+        .filter(|result| match args.encoding {
+            Encoding::All => true,
+            Encoding::Ascii => result.encoding == "ascii",
+            Encoding::Utf16 => result.encoding == "utf16le",
+        })
+        .collect();
 
     match args.output {
         Some(path) => {
@@ -219,17 +339,7 @@ fn main() -> Result<(), String> {
             .map_err(|e| format!("write failed: {e}"))?;
         }
     }
-    if args.stats || io::stderr().is_terminal() {
-        let elapsed = start.elapsed().as_secs_f64();
-        eprintln!("--- ratdmp scan ---");
-        eprintln!("results    : {}", results.len());
-        eprintln!("file size  : {} bytes", file_size);
-        eprintln!("threads    : {threads}");
-        eprintln!("elapsed    : {:.3} ms", elapsed * 1000.0);
-        eprintln!(
-            "throughput : {:.2} MiB/s",
-            file_size as f64 / elapsed.max(f64::MIN_POSITIVE) / 1_048_576.0
-        );
-    }
+    let _ = args.stats;
+    print_report(&results, file_size, start.elapsed().as_secs_f64(), threads);
     Ok(())
 }
