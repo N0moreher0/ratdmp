@@ -1,13 +1,15 @@
 # ratdmp
 
 ```text
-                 _ __ ___   __| |_ __ ___  _ __
-                | '_ ` _ \ / _` | '__/ _ \| '_ \
-                | | | | | | (_| | | | (_) | |_) |
-                |_| |_| |_|\__,_|_|  \___/| .__/
-                                          |_|
++------------------------------------------------------------+
+|  RRRR    AAA   TTTTT  DDDD   MMM MMM  PPPP                 |
+|  R   R  A   A    T    D   D  M M M M  P   P                |
+|  RRRR   AAAAA    T    D   D  M  M  M  PPPP                 |
+|  R  R   A   A    T    D   D  M     M  P                    |
+|  R   R  A   A    T    DDDD   M     M  P                    |
++------------------------------------------------------------+
 
-             Fast, composable memory-dump string extraction
+             Fast, composable memory-dump extraction
 ```
 
 > **A focused Rust library for building your own DFIR and malware-analysis
