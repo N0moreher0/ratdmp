@@ -40,6 +40,7 @@ ratdmp memory.dmp --noise-threshold 16 --threads 4
 - Conservative repeat-noise filtering.
 - Parallel scanning with explicit threads or `--auto-tune`.
 - Text or JSON output.
+- Default single-worker scans stream results directly to the output.
 - Automatic scan summary and priority triage signals on `stderr`.
 - IPv4/IPv6 and common crypto-wallet address triage signals.
 - Clean stdout for shell pipelines and automation.

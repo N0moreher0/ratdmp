@@ -1,5 +1,6 @@
 use ratdmp::{
-    extract_strings_from_file_parallel, extract_strings_from_file_with_noise_config,
+    extract_strings_from_file_parallel, extract_strings_from_file_streaming,
+    extract_strings_from_file_with_noise_config,
     ExtractedString, NoiseConfig, MAX_STRINGS, MIN_STRING_LEN,
 };
 use std::fs::File;
@@ -297,22 +298,17 @@ fn print_banner(path: &str, size: u64, format: Format) {
     eprintln!("  \x1b[1;34m[..] scanning\x1b[0m");
 }
 
-fn print_report(results: &[ExtractedString], size: u64, elapsed: f64, threads: usize) {
+fn print_report(
+    result_count: usize,
+    short: usize,
+    medium: usize,
+    long: usize,
+    important: &[ExtractedString],
+    size: u64,
+    elapsed: f64,
+    threads: usize,
+) {
     let color = io::stderr().is_terminal();
-    let mut short = 0;
-    let mut medium = 0;
-    let mut long = 0;
-    let mut important = Vec::new();
-    for result in results {
-        match result.text.chars().count() {
-            0..=7 => short += 1,
-            8..=31 => medium += 1,
-            _ => long += 1,
-        }
-        if important_reason(&result.text).is_some() && important.len() < 12 {
-            important.push(result);
-        }
-    }
     if color {
         eprintln!("\x1b[1;32m  [OK] scan complete\x1b[0m");
         eprintln!("\x1b[1;36m+-------------------- summary -----------------------------+\x1b[0m");
@@ -320,7 +316,7 @@ fn print_report(results: &[ExtractedString], size: u64, elapsed: f64, threads: u
         eprintln!("  [OK] scan complete");
         eprintln!("+-------------------- summary -----------------------------+");
     }
-    eprintln!("  results    : {}", results.len());
+    eprintln!("  results    : {result_count}");
     eprintln!("  length     : {short} short | {medium} medium | {long} long");
     eprintln!("  threads    : {threads}");
     eprintln!("  file size  : {size} bytes");
@@ -340,6 +336,48 @@ fn print_report(results: &[ExtractedString], size: u64, elapsed: f64, threads: u
             );
         }
     }
+
+}
+
+fn record_result(
+    result: ExtractedString,
+    writer: &mut dyn Write,
+    format: Format,
+    result_count: &mut usize,
+    short: &mut usize,
+    medium: &mut usize,
+    long: &mut usize,
+    important: &mut Vec<ExtractedString>,
+) -> io::Result<()> {
+    match format {
+        Format::Text => writeln!(
+            writer,
+            "{:#010x}\t{}\t{}",
+            result.offset, result.encoding, result.text
+        )?,
+        Format::Json => {
+            if *result_count > 0 {
+                write!(writer, ",\n")?;
+            }
+            write!(
+                writer,
+                "  {{\"offset\":{},\"encoding\":{},\"text\":{}}}",
+                result.offset,
+                json_escape(result.encoding),
+                json_escape(&result.text)
+            )?;
+        }
+    }
+    *result_count += 1;
+    match result.text.chars().count() {
+        0..=7 => *short += 1,
+        8..=31 => *medium += 1,
+        _ => *long += 1,
+    }
+    if important.len() < 12 && important_reason(&result.text).is_some() {
+        important.push(result);
+    }
+    Ok(())
 }
 
 fn write_results(
@@ -398,6 +436,68 @@ fn main() -> Result<(), String> {
         .map(NoiseConfig::from_threshold)
         .unwrap_or_default();
     let start = Instant::now();
+    if threads == 1 {
+        let mut writer: Box<dyn Write> = match args.output.as_ref() {
+            Some(path) => Box::new(BufWriter::new(
+                File::create(path).map_err(|e| format!("cannot create '{path}': {e}"))?,
+            )),
+            None => Box::new(BufWriter::new(io::stdout().lock())),
+        };
+        if args.format == Format::Json {
+            write!(writer, "[\n").map_err(|e| format!("write failed: {e}"))?;
+        }
+        let mut result_count = 0;
+        let mut short = 0;
+        let mut medium = 0;
+        let mut long = 0;
+        let mut important = Vec::new();
+        let mut write_error = None;
+        extract_strings_from_file_streaming(
+            &args.path,
+            args.min_len,
+            args.max_strings,
+            noise,
+            |result| {
+                if write_error.is_some() {
+                    return;
+                }
+                if matches!(args.encoding, Encoding::All)
+                    || (args.encoding == Encoding::Ascii && result.encoding == "ascii")
+                    || (args.encoding == Encoding::Utf16 && result.encoding == "utf16le")
+                {
+                    if let Err(error) = record_result(
+                        result,
+                        &mut writer,
+                        args.format,
+                        &mut result_count,
+                        &mut short,
+                        &mut medium,
+                        &mut long,
+                        &mut important,
+                    ) {
+                        write_error = Some(error);
+                    }
+                }
+            },
+        )
+        .map_err(|e| format!("scan failed: {e}"))?;
+        if let Some(error) = write_error {
+            return Err(format!("write failed: {error}"));
+        }
+        if args.format == Format::Json {
+            write!(writer, "\n]\n").map_err(|e| format!("write failed: {e}"))?;
+        }
+        writer.flush().map_err(|e| format!("write failed: {e}"))?;
+        if let Some(path) = args.output {
+            eprintln!("wrote {result_count} results to '{path}'");
+        }
+        print_report(
+            result_count, short, medium, long, &important, file_size,
+            start.elapsed().as_secs_f64(), threads,
+        );
+        return Ok(());
+    }
+
     let results = if threads > 1 {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -441,6 +541,23 @@ fn main() -> Result<(), String> {
         }
     }
     let _ = args.stats;
-    print_report(&results, file_size, start.elapsed().as_secs_f64(), threads);
+    let mut short = 0;
+    let mut medium = 0;
+    let mut long = 0;
+    let mut important = Vec::new();
+    for result in &results {
+        match result.text.chars().count() {
+            0..=7 => short += 1,
+            8..=31 => medium += 1,
+            _ => long += 1,
+        }
+        if important.len() < 12 && important_reason(&result.text).is_some() {
+            important.push(result.clone());
+        }
+    }
+    print_report(
+        results.len(), short, medium, long, &important, file_size,
+        start.elapsed().as_secs_f64(), threads,
+    );
     Ok(())
 }

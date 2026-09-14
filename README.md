@@ -217,6 +217,8 @@ not a verdict that a value is valid, active, or malicious.
 
 The normal file and reader APIs use bounded streaming memory. They are a good
 default for very large dumps, slow disks, and memory-constrained systems.
+The CLI's default single-worker mode streams each result directly to its
+output instead of retaining the complete result set in memory.
 
 For fast storage and CPU-heavy workloads, use the parallel API inside your own
 controlled worker pool:

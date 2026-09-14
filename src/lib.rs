@@ -523,6 +523,74 @@ pub fn extract_strings_from_reader_with_noise_config<R: Read>(
     Ok(results)
 }
 
+/// Streams extracted strings to `on_found` while scanning a reader.
+///
+/// The input is still read in fixed-size chunks, but results are delivered
+/// immediately instead of being accumulated in a `Vec`. This keeps memory
+/// bounded by the scan buffer and the caller's callback state.
+pub fn extract_strings_from_reader_streaming<R: Read, F: FnMut(ExtractedString)>(
+    mut reader: R,
+    min_len: usize,
+    max_strings: usize,
+    noise_cfg: NoiseConfig,
+    mut on_found: F,
+) -> std::io::Result<usize> {
+    let emitted = std::cell::Cell::new(0usize);
+    let mut scanner_callback = |s: ExtractedString| {
+        if emitted.get() < max_strings {
+            emitted.set(emitted.get() + 1);
+            on_found(s);
+        }
+    };
+    let mut scanner = StringRunScanner::new(min_len, noise_cfg, &mut scanner_callback);
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut global_base = 0u64;
+    let mut carry_len = 0usize;
+
+    while emitted.get() < max_strings {
+        let to_read_into = buffer.len() - carry_len;
+        let mut read_total = 0usize;
+        while read_total < to_read_into {
+            let n = reader.read(&mut buffer[carry_len + read_total..carry_len + to_read_into])?;
+            if n == 0 {
+                break;
+            }
+            read_total += n;
+        }
+
+        let len = carry_len + read_total;
+        if len == 0 {
+            break;
+        }
+        let is_last_chunk = read_total < to_read_into;
+        if is_last_chunk {
+            scanner.feed(&buffer, 0, len, len, global_base);
+            scanner.flush_all();
+            break;
+        }
+
+        scanner.feed(&buffer, 0, len - 1, len, global_base);
+        buffer[0] = buffer[len - 1];
+        carry_len = 1;
+        global_base += (len - 1) as u64;
+    }
+
+    Ok(emitted.get())
+}
+
+/// File-based streaming variant of [`extract_strings_from_reader_streaming`].
+pub fn extract_strings_from_file_streaming<F: FnMut(ExtractedString)>(
+    dump_path: &str,
+    min_len: usize,
+    max_strings: usize,
+    noise_cfg: NoiseConfig,
+    on_found: F,
+) -> std::io::Result<usize> {
+    let file = File::open(dump_path)?;
+    let reader = BufReader::with_capacity(1 << 16, file);
+    extract_strings_from_reader_streaming(reader, min_len, max_strings, noise_cfg, on_found)
+}
+
 /// Extracts strings from a `.dmp` file, in chunks -- does NOT
 /// read the whole file into RAM.
 pub fn extract_strings_from_file(

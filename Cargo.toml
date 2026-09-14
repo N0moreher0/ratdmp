@@ -1,6 +1,6 @@
 [package]
 name = "ratdmp"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Fast streaming ASCII/UTF-16LE string extractor for raw memory dump (.dmp) files, with simple noise filtering for byte-fill/heap-fill patterns. Never loads the whole file into RAM."
