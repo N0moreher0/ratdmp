@@ -1,0 +1,19 @@
+[package]
+name = "ratdmp-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Command-line frontend for the ratdmp memory-dump string extraction library"
+readme = "README.md"
+repository = "https://github.com/N0moreher0/ratdmp"
+keywords = ["strings", "forensics", "memory-dump", "malware", "dfir"]
+categories = ["command-line-utilities"]
+rust-version = "1.70"
+
+[dependencies]
+ratdmp = "0.5.1"
+rayon = "1"
+
+[[bin]]
+name = "ratdmp"
+path = "src/main.rs"

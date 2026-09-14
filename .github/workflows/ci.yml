@@ -24,3 +24,9 @@ jobs:
 
       - name: Package
         run: cargo package --locked
+
+      - name: Check CLI
+        run: cargo check --manifest-path cli/Cargo.toml --locked
+
+      - name: Test CLI
+        run: cargo test --manifest-path cli/Cargo.toml --locked
