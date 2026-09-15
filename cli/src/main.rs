@@ -614,6 +614,56 @@ fn print_banner(path: &str, size: u64, format: Format) {
     eprintln!("  \x1b[1;34m[..] scanning\x1b[0m");
 }
 
+fn print_selected_options(args: &Args, threads: usize) {
+    let format = match args.format {
+        Format::Text => "text",
+        Format::Json => "json",
+    };
+    let encoding = match args.encoding {
+        Encoding::All => "all",
+        Encoding::Ascii => "ascii",
+        Encoding::Utf16 => "utf16",
+    };
+    let noise = args
+        .noise_threshold
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "default".to_string());
+    let yara = args.yar.as_deref().unwrap_or("off");
+    let brute_xor = args
+        .brute_xor
+        .as_ref()
+        .map(|sizes| {
+            sizes
+                .iter()
+                .map(|size| format!("{size}b"))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_else(|| "off".to_string());
+    let output = args.output.as_deref().unwrap_or("stdout");
+    let auto_tune = if args.auto_tune { "on" } else { "off" };
+    let parse_pid = if args.parse_pid { "on" } else { "off" };
+    let entropy = if args.entropy { "on" } else { "off" };
+
+    if io::stderr().is_terminal() {
+        eprintln!("\x1b[1;36m  selected options\x1b[0m");
+    } else {
+        eprintln!("  selected options");
+    }
+    eprintln!(
+        "    format={format} encoding={encoding} min-len={} max-strings={}",
+        args.min_len, args.max_strings
+    );
+    eprintln!(
+        "    threads={threads} auto-tune={auto_tune} noise-threshold={noise}"
+    );
+    eprintln!(
+        "    entropy={entropy} yara={} brute-xor={} parse-pid={parse_pid}",
+        yara, brute_xor
+    );
+    eprintln!("    output={output}");
+}
+
 fn print_report(
     result_count: usize,
     short: usize,
@@ -764,6 +814,7 @@ fn main() -> Result<(), String> {
         .noise_threshold
         .map(NoiseConfig::from_threshold)
         .unwrap_or_default();
+    print_selected_options(&args, threads);
     let start = Instant::now();
     let mut entropy_regions = Vec::new();
     if args.entropy {

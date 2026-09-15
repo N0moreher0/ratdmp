@@ -47,6 +47,8 @@ Then scan immediately:
 ```powershell
 ratdmp memory.dmp --auto-tune
 ratdmp memory.dmp --entropy --format json -o triage.json
+ratdmp memory.dmp --yar rules.yar --format json -o yara.json
+ratdmp memory.dmp --brute-xor "1b;2b" --format json -o xor.json
 ```
 
 Update an existing installation:
@@ -91,7 +93,7 @@ padding bytes. `ratdmp` gives applications a predictable core:
 
 ```toml
 [dependencies]
-ratdmp = "0.5"
+ratdmp = "0.9.1"
 ```
 
 Or:
@@ -139,6 +141,8 @@ fn main() -> std::io::Result<()> {
 | `extract_strings_from_file` | Scan a file with bounded memory |
 | `extract_strings_from_file_with_noise_config` | File scan with custom filtering |
 | `extract_strings_from_file_parallel` | Opt-in parallel file scan |
+| `scan_yara_from_reader_streaming` | Stream bytes through compiled YARA rules |
+| `scan_yara_from_file_streaming` | Compile a rule file and scan a dump |
 | `NoiseConfig` | Configure or disable repeat-pattern filtering |
 
 Every result is an `ExtractedString`:
@@ -213,6 +217,8 @@ The CLI adds:
 - `--min-len` and `--max-strings`
 - `--noise-threshold`
 - `--threads` and `--auto-tune`
+- `--format`, `--encoding`, `--min-len`, and `--max-strings` are echoed to
+  `stderr` in a selected-options block before scanning.
 - `--entropy` to export high-entropy memory regions
 - `--yar <PATH>` to compile and match a YARA rule file during bounded
   streaming scan (matched rules are emitted as `group: "YARA"` records)
@@ -233,6 +239,32 @@ When enabled, fixed-size high-entropy regions are exported as `Undefined`
 records in both text and JSON output. Each record includes its offset, length,
 measured entropy, and original bytes encoded as hexadecimal; ratdmp does not
 decrypt or identify the underlying compression/encryption format.
+
+### Optional XOR brute-force triage
+
+`--brute-xor` is deliberately implemented in `ratdmp-cli`, not in the Core
+library. It collects up to 256 non-zero byte candidates, each between 10 and
+100 bytes, then tries the requested repeating-key XOR sizes:
+
+```powershell
+ratdmp memory.dmp --brute-xor "1b"
+ratdmp memory.dmp --brute-xor "1b;2b" --format json -o xor.json
+```
+
+Candidates are ranked by printable ASCII/whitespace ratio, valid UTF-8, and
+bonus terms such as `http`, `www`, `.exe`, `.dll`, `Virtual`, `Create`, and
+`Thread`. The CLI retains the top five results per candidate after combining
+the selected key sizes. One-byte XOR is cheap; two-byte XOR is substantially
+more expensive, and three-byte XOR is exhaustive over 16,777,216 keys per
+candidate. `--auto-tune` currently tunes string-extraction workers; it does
+not parallelize the XOR brute-force loop.
+
+### YARA streaming
+
+The Core exposes `scan_yara_from_reader_streaming` and
+`scan_yara_from_file_streaming`. The CLI's `--yar <PATH>` compiles the rule
+file and scans bounded chunks with overlap, so rules crossing an I/O boundary
+remain visible without loading the complete dump into memory.
 
 ## Streaming and parallel scanning
 

@@ -16,7 +16,7 @@ Professional command-line frontend for the
 ## Install
 
 ```bash
-cargo install ratdmp-cli
+cargo install ratdmp-cli --version 1.0.1
 ```
 
 This downloads the core library, builds an optimized `ratdmp` executable, and
@@ -41,6 +41,9 @@ ratdmp memory.dmp --brute-xor "1b;2b" --format json -o xor.json
 - Configurable minimum length and result limits.
 - Conservative repeat-noise filtering.
 - Parallel scanning with explicit threads or `--auto-tune`.
+- Before scanning, the CLI prints the effective selected options to `stderr`
+  (`format`, `encoding`, limits, workers, entropy, YARA, XOR, PID parsing,
+  and output destination).
 - Text or JSON output.
 - Default single-worker scans stream results directly to the output.
 - `--entropy` enables high-entropy region hints in the report on `stderr`.
@@ -50,6 +53,10 @@ ratdmp memory.dmp --brute-xor "1b;2b" --format json -o xor.json
   non-zero byte candidates, tries the selected XOR key sizes, scores printable
   ASCII/UTF-8 output, boosts useful IOC terms, and retains the top five
   results per candidate/key size.
+- XOR ranking uses printable ASCII/whitespace ratio, valid UTF-8, and bonuses
+  for `http`, `www`, `.exe`, `.dll`, `Virtual`, `Create`, and `Thread`.
+- `--auto-tune` selects extraction workers; it does not currently parallelize
+  the brute-force XOR loop. Prefer `1b` or `1b;2b` for practical triage.
 - JSON output also includes each matching region as a `group: "Undefined"`
   record with its bytes encoded as `data_hex`.
 - Text output includes the same `Undefined` entropy records with
@@ -62,3 +69,11 @@ ratdmp memory.dmp --brute-xor "1b;2b" --format json -o xor.json
 - Clean stdout for shell pipelines and automation.
 
 Run `ratdmp --help` for the complete option list.
+
+## Output groups
+
+- Extracted strings are emitted with their offset and encoding.
+- Entropy records use `group: "Undefined"` and include `data_hex`.
+- YARA records use `group: "YARA"` and include namespace and rule name.
+- XOR records use `group: "XOR"` and include candidate offset, key hex,
+  score, and decoded plaintext.
