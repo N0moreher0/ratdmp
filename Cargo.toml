@@ -1,6 +1,6 @@
 [package]
 name = "ratdmp"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Fast streaming ASCII/UTF-16LE string extractor for raw memory dump (.dmp) files, with simple noise filtering for byte-fill/heap-fill patterns. Never loads the whole file into RAM."
@@ -22,3 +22,6 @@ serde = { version = "1", features = ["derive"] }
 # Used by the opt-in parallel scanning path. Work-stealing thread pool for
 # splitting the file scan across cores.
 rayon = "1"
+
+# Pure-Rust YARA implementation used by the optional on-the-fly rule scan.
+yara-x = "1.20"

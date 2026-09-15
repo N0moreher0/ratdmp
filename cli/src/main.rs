@@ -1,15 +1,19 @@
 use ratdmp::{
     extract_strings_from_file_parallel, extract_strings_from_file_streaming,
     extract_strings_from_file_with_noise_config,
-    scan_entropy_from_file_streaming_with_data, EntropyRegion,
+    scan_entropy_from_file_streaming_with_data, scan_yara_from_file_streaming, EntropyRegion,
     ExtractedString, NoiseConfig, MAX_STRINGS, MIN_STRING_LEN,
 };
 use std::fs::File;
-use std::io::{self, BufWriter, IsTerminal, Write};
+use std::io::{self, BufReader, BufWriter, IsTerminal, Read, Write};
 use std::time::Instant;
 
 const ENTROPY_THRESHOLD: f64 = 7.2;
 const MAX_ENTROPY_REPORTS: usize = 12;
+const MAX_XOR_CANDIDATES: usize = 256;
+const MAX_XOR_CANDIDATE_LEN: usize = 100;
+const MIN_XOR_CANDIDATE_LEN: usize = 10;
+const MAX_XOR_RESULTS_PER_CANDIDATE: usize = 5;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Format {
@@ -28,6 +32,8 @@ struct Args {
     threads: usize,
     auto_tune: bool,
     entropy: bool,
+    yar: Option<String>,
+    brute_xor: Option<Vec<usize>>,
     parse_pid: bool,
     stats: bool,
 }
@@ -64,6 +70,9 @@ OPTIONS:
     --threads <N>        Parallel worker count
     --auto-tune          Choose a safe worker count for this machine
     --entropy            Scan and export high-entropy regions
+    --yar <PATH>         Compile and match a YARA/YARA-X rule file while streaming
+    --brute-xor <1b;2b;3b>
+                          Brute-force XOR candidates using selected key sizes
     --parse-pid          Map PID markers in extracted strings
     --stats              Always-on report compatibility flag
     -h, --help           Show this help
@@ -87,6 +96,8 @@ fn parse_args() -> Result<Args, String> {
         threads: 1,
         auto_tune: false,
         entropy: false,
+        yar: None,
+        brute_xor: None,
         parse_pid: false,
         stats: false,
     };
@@ -144,6 +155,28 @@ fn parse_args() -> Result<Args, String> {
             }
             "--auto-tune" => args.auto_tune = true,
             "--entropy" => args.entropy = true,
+            "--yar" => args.yar = Some(next(&mut i)?),
+            "--brute-xor" => {
+                let value = next(&mut i)?;
+                let mut sizes = Vec::new();
+                for part in value.split([';', ',']) {
+                    let size = part
+                        .strip_suffix('b')
+                        .unwrap_or(part)
+                        .parse::<usize>()
+                        .map_err(|_| "invalid --brute-xor key size".to_string())?;
+                    if !(1..=3).contains(&size) {
+                        return Err("--brute-xor supports key sizes 1b, 2b, and 3b".to_string());
+                    }
+                    if !sizes.contains(&size) {
+                        sizes.push(size);
+                    }
+                }
+                if sizes.is_empty() {
+                    return Err("--brute-xor requires at least one key size".to_string());
+                }
+                args.brute_xor = Some(sizes);
+            }
             "--parse-pid" => args.parse_pid = true,
             "--stats" => args.stats = true,
             other => return Err(format!("unknown option '{other}'")),
@@ -214,6 +247,179 @@ fn write_entropy_text(
         region.entropy,
         hex_encode(data)
     )
+}
+
+fn write_yara_text(
+    rule: &ratdmp::YaraMatch,
+    writer: &mut dyn Write,
+) -> io::Result<()> {
+    writeln!(
+        writer,
+        "{:#010x}\tYARA\t{}::{}",
+        rule.offset, rule.namespace, rule.rule
+    )
+}
+
+fn write_yara_json(
+    rule: &ratdmp::YaraMatch,
+    writer: &mut dyn Write,
+    result_count: &mut usize,
+) -> io::Result<()> {
+    if *result_count > 0 {
+        write!(writer, ",\n")?;
+    }
+    write!(
+        writer,
+        "  {{\"group\":\"YARA\",\"offset\":{},\"namespace\":{},\"rule\":{}}}",
+        rule.offset,
+        json_escape(&rule.namespace),
+        json_escape(&rule.rule)
+    )?;
+    *result_count += 1;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct XorResult {
+    offset: u64,
+    key: Vec<u8>,
+    plaintext: Vec<u8>,
+    score: f64,
+}
+
+fn xor_printable_score(data: &[u8]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let printable = data
+        .iter()
+        .filter(|&&byte| (32..=126).contains(&byte) || byte == b'\t' || byte == b'\n' || byte == b'\r')
+        .count();
+    let text = String::from_utf8_lossy(data).to_ascii_lowercase();
+    let mut score = printable as f64 / data.len() as f64;
+    if std::str::from_utf8(data).is_ok() {
+        score += 0.15;
+    }
+    for keyword in ["http", "www", ".exe", ".dll", "virtual", "create", "thread"] {
+        if text.contains(keyword) {
+            score += 0.25;
+        }
+    }
+    score
+}
+
+fn xor_top_results(candidate: &[u8], offset: u64, key_size: usize) -> Vec<XorResult> {
+    let key_count = 1usize << (key_size * 8);
+    let mut top = Vec::with_capacity(MAX_XOR_RESULTS_PER_CANDIDATE);
+    for value in 0..key_count {
+        let mut key = vec![0u8; key_size];
+        for (index, byte) in key.iter_mut().enumerate() {
+            *byte = ((value >> (index * 8)) & 0xff) as u8;
+        }
+        let plaintext: Vec<u8> = candidate
+            .iter()
+            .enumerate()
+            .map(|(index, &byte)| byte ^ key[index % key_size])
+            .collect();
+        let result = XorResult {
+            offset,
+            key,
+            score: xor_printable_score(&plaintext),
+            plaintext,
+        };
+        let position = top
+            .iter()
+            .position(|item: &XorResult| result.score > item.score)
+            .unwrap_or(top.len());
+        top.insert(position, result);
+        if top.len() > MAX_XOR_RESULTS_PER_CANDIDATE {
+            top.pop();
+        }
+    }
+    top
+}
+
+fn collect_xor_candidates(path: &str) -> io::Result<Vec<(u64, Vec<u8>)>> {
+    let mut reader = BufReader::with_capacity(1 << 16, File::open(path)?);
+    let mut byte = [0u8; 1];
+    let mut run = Vec::new();
+    let mut run_offset = 0u64;
+    let mut offset = 0u64;
+    let mut candidates = Vec::new();
+    loop {
+        let read = reader.read(&mut byte)?;
+        if read == 0 {
+            break;
+        }
+        if byte[0] == 0 {
+            append_xor_candidates(&mut candidates, run_offset, &run);
+            run.clear();
+        } else {
+            if run.is_empty() {
+                run_offset = offset;
+            }
+            run.push(byte[0]);
+        }
+        offset += 1;
+        if candidates.len() >= MAX_XOR_CANDIDATES {
+            break;
+        }
+    }
+    if candidates.len() < MAX_XOR_CANDIDATES {
+        append_xor_candidates(&mut candidates, run_offset, &run);
+    }
+    candidates.truncate(MAX_XOR_CANDIDATES);
+    Ok(candidates)
+}
+
+fn append_xor_candidates(candidates: &mut Vec<(u64, Vec<u8>)>, offset: u64, data: &[u8]) {
+    if data.len() < MIN_XOR_CANDIDATE_LEN {
+        return;
+    }
+    for (index, chunk) in data.chunks(MAX_XOR_CANDIDATE_LEN).enumerate() {
+        if chunk.len() >= MIN_XOR_CANDIDATE_LEN
+            && !chunk.windows(2).all(|window| window[0] == window[1])
+            && !chunk
+                .windows(3)
+                .all(|window| window[0] == window[2] && window[0] != window[1])
+        {
+            candidates.push((offset + (index * MAX_XOR_CANDIDATE_LEN) as u64, chunk.to_vec()));
+            if candidates.len() >= MAX_XOR_CANDIDATES {
+                return;
+            }
+        }
+    }
+}
+
+fn write_xor_text(result: &XorResult, writer: &mut dyn Write) -> io::Result<()> {
+    writeln!(
+        writer,
+        "{:#010x}\tXOR\tkey={}\tscore={:.3}\t{}",
+        result.offset,
+        hex_encode(&result.key),
+        result.score,
+        String::from_utf8_lossy(&result.plaintext)
+    )
+}
+
+fn write_xor_json(
+    result: &XorResult,
+    writer: &mut dyn Write,
+    result_count: &mut usize,
+) -> io::Result<()> {
+    if *result_count > 0 {
+        write!(writer, ",\n")?;
+    }
+    write!(
+        writer,
+        "  {{\"group\":\"XOR\",\"offset\":{},\"key\":{},\"score\":{:.6},\"plaintext\":{}}}",
+        result.offset,
+        json_escape(&hex_encode(&result.key)),
+        result.score,
+        json_escape(&String::from_utf8_lossy(&result.plaintext))
+    )?;
+    *result_count += 1;
+    Ok(())
 }
 
 fn write_string_json(
@@ -568,6 +774,38 @@ fn main() -> Result<(), String> {
         })
         .map_err(|e| format!("entropy scan failed: {e}"))?;
     }
+    let mut yara_matches = Vec::new();
+    if let Some(rules_path) = args.yar.as_ref() {
+        scan_yara_from_file_streaming(&args.path, rules_path, |matched| {
+            yara_matches.push(matched);
+        })
+        .map_err(|e| format!("YARA scan failed: {e}"))?;
+    }
+    let mut xor_results = Vec::new();
+    if let Some(key_sizes) = args.brute_xor.as_ref() {
+        let candidates = collect_xor_candidates(&args.path)
+            .map_err(|e| format!("XOR candidate scan failed: {e}"))?;
+        for (offset, candidate) in candidates {
+            let mut candidate_results = Vec::new();
+            for &key_size in key_sizes {
+                candidate_results.extend(xor_top_results(&candidate, offset, key_size));
+            }
+            candidate_results.sort_by(|left, right| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            candidate_results.truncate(MAX_XOR_RESULTS_PER_CANDIDATE);
+            xor_results.extend(candidate_results);
+        }
+        xor_results.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
     if threads == 1 {
         let mut writer: Box<dyn Write> = match args.output.as_ref() {
             Some(path) => Box::new(BufWriter::new(
@@ -619,6 +857,14 @@ fn main() -> Result<(), String> {
         }
         if args.format == Format::Json {
             let mut json_count = result_count;
+            for matched in &yara_matches {
+                write_yara_json(matched, &mut writer, &mut json_count)
+                    .map_err(|e| format!("write failed: {e}"))?;
+            }
+            for result in &xor_results {
+                write_xor_json(result, &mut writer, &mut json_count)
+                    .map_err(|e| format!("write failed: {e}"))?;
+            }
             if args.entropy {
                 scan_entropy_from_file_streaming_with_data(
                     &args.path,
@@ -639,7 +885,16 @@ fn main() -> Result<(), String> {
                 return Err(format!("write failed: {error}"));
             }
             write!(writer, "\n]\n").map_err(|e| format!("write failed: {e}"))?;
-        } else if args.entropy {
+        } else {
+            for matched in &yara_matches {
+                write_yara_text(matched, &mut writer)
+                    .map_err(|e| format!("write failed: {e}"))?;
+            }
+            for result in &xor_results {
+                write_xor_text(result, &mut writer)
+                    .map_err(|e| format!("write failed: {e}"))?;
+            }
+            if args.entropy {
             scan_entropy_from_file_streaming_with_data(
                 &args.path,
                 ENTROPY_THRESHOLD,
@@ -654,6 +909,7 @@ fn main() -> Result<(), String> {
             .map_err(|e| format!("entropy scan failed: {e}"))?;
             if let Some(error) = write_error {
                 return Err(format!("write failed: {error}"));
+            }
             }
         }
         writer.flush().map_err(|e| format!("write failed: {e}"))?;
@@ -707,6 +963,14 @@ fn main() -> Result<(), String> {
             write_string_json(result, &mut writer, &mut json_count, args.parse_pid)
             .map_err(|e| format!("write failed: {e}"))?;
         }
+        for matched in &yara_matches {
+            write_yara_json(matched, &mut writer, &mut json_count)
+            .map_err(|e| format!("write failed: {e}"))?;
+        }
+        for result in &xor_results {
+            write_xor_json(result, &mut writer, &mut json_count)
+                .map_err(|e| format!("write failed: {e}"))?;
+        }
         if args.entropy {
             let mut entropy_write_error = None;
             scan_entropy_from_file_streaming_with_data(
@@ -731,6 +995,14 @@ fn main() -> Result<(), String> {
     } else {
         write_results(&results, args.format, &mut writer, args.parse_pid)
             .map_err(|e| format!("write failed: {e}"))?;
+        for matched in &yara_matches {
+            write_yara_text(matched, &mut writer)
+                .map_err(|e| format!("write failed: {e}"))?;
+        }
+        for result in &xor_results {
+            write_xor_text(result, &mut writer)
+                .map_err(|e| format!("write failed: {e}"))?;
+        }
         if args.entropy && args.format == Format::Text {
             let mut entropy_write_error = None;
             scan_entropy_from_file_streaming_with_data(

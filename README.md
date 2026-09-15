@@ -214,6 +214,10 @@ The CLI adds:
 - `--noise-threshold`
 - `--threads` and `--auto-tune`
 - `--entropy` to export high-entropy memory regions
+- `--yar <PATH>` to compile and match a YARA rule file during bounded
+  streaming scan (matched rules are emitted as `group: "YARA"` records)
+- `--brute-xor <1b;2b;3b>` to opt into bounded candidate collection and
+  printable/UTF-8 scored XOR brute-forcing in the CLI only
 - `--parse-pid` to map common PID markers in extracted strings
 - `-o/--output`
 - automatic scan reports and priority triage signals on `stderr`

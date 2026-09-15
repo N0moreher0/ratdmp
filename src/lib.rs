@@ -55,6 +55,80 @@ use serde::Serialize;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
+/// A YARA rule that matched while a dump was being streamed.
+#[derive(Debug, Clone, Serialize)]
+pub struct YaraMatch {
+    pub rule: String,
+    pub namespace: String,
+    pub offset: u64,
+}
+
+/// Compiles YARA source and scans a reader in bounded chunks.
+///
+/// A small overlap is retained between chunks so literals and regular
+/// expressions crossing an I/O boundary are still visible to YARA. Rules are
+/// reported once, at the first chunk in which they match.
+pub fn scan_yara_from_reader_streaming<R: Read, F: FnMut(YaraMatch)>(
+    mut reader: R,
+    rules_source: &str,
+    mut on_match: F,
+) -> std::io::Result<usize> {
+    let rules = yara_x::compile(rules_source).map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+    })?;
+    let mut scanner = yara_x::Scanner::new(&rules);
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut carry = Vec::new();
+    let mut global_offset = 0u64;
+    let mut reported = std::collections::HashSet::new();
+    let mut count = 0usize;
+
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let mut window = Vec::with_capacity(carry.len() + read);
+        window.extend_from_slice(&carry);
+        window.extend_from_slice(&buffer[..read]);
+        let window_offset = global_offset.saturating_sub(carry.len() as u64);
+        let results = scanner.scan(&window).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+        })?;
+        for rule in results.matching_rules() {
+            let key = format!("{}:{}", rule.namespace(), rule.identifier());
+            if reported.insert(key) {
+                on_match(YaraMatch {
+                    rule: rule.identifier().to_string(),
+                    namespace: rule.namespace().to_string(),
+                    offset: window_offset,
+                });
+                count += 1;
+            }
+        }
+        carry.clear();
+        let overlap = window.len().min(YARA_OVERLAP_SIZE);
+        carry.extend_from_slice(&window[window.len() - overlap..]);
+        global_offset += read as u64;
+    }
+    Ok(count)
+}
+
+/// File-based convenience wrapper for [`scan_yara_from_reader_streaming`].
+pub fn scan_yara_from_file_streaming<F: FnMut(YaraMatch)>(
+    dump_path: &str,
+    rules_path: &str,
+    on_match: F,
+) -> std::io::Result<usize> {
+    let rules_source = std::fs::read_to_string(rules_path)?;
+    let file = File::open(dump_path)?;
+    scan_yara_from_reader_streaming(
+        BufReader::with_capacity(1 << 16, file),
+        &rules_source,
+        on_match,
+    )
+}
+
 /// Default `min_len` when the caller doesn't pass one -- a reasonable
 /// baseline for the `extract_strings*` functions below when the caller
 /// wants a sensible default instead of picking their own.
@@ -128,6 +202,9 @@ impl NoiseConfig {
 // File chunk size per read -- large enough for efficient I/O,
 // small enough to not accumulate too much RAM for the buffer.
 const CHUNK_SIZE: usize = 32 * 1024 * 1024;
+// Keeps ordinary YARA literals and bounded regexes visible across chunk
+// boundaries without turning the streaming scan into a whole-file read.
+const YARA_OVERLAP_SIZE: usize = 64 * 1024;
 /// Fixed window used by the entropy pass. Keeping this separate from the
 /// string-scan chunk makes entropy results comparable across files.
 pub const ENTROPY_BLOCK_SIZE: usize = 64 * 1024;
@@ -832,6 +909,28 @@ mod tests {
 
         let mixed: Vec<u8> = (0..=255).cycle().take(4096).collect();
         assert!((shannon_entropy(&mixed) - 8.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn yara_reader_scan_reports_matching_rule() {
+        let rules = r#"
+            rule marker {
+                strings:
+                    $s = "password123"
+                condition:
+                    $s
+            }
+        "#;
+        let mut matches = Vec::new();
+        let count = scan_yara_from_reader_streaming(
+            std::io::Cursor::new(b"prefix password123 suffix"),
+            rules,
+            |matched| matches.push(matched),
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(matches[0].rule, "marker");
+        assert_eq!(matches[0].namespace, "default");
     }
 
     #[test]
