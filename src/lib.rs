@@ -1,5 +1,5 @@
-//! `ratdmp` -- a standalone crate (open source, dual-licensed
-//! MIT/Apache-2.0). Depends on `serde` (so `ExtractedString` can be
+//! `ratdmp` -- a standalone crate (open source, licensed under GPLv3).
+//! Depends on `serde` (so `ExtractedString` can be
 //! serialized -- the caller decides how to wrap it in JSON/its own protocol
 //! if needed, this crate only returns a plain `Vec<ExtractedString>`) and
 //! `rayon`, used only by the opt-in parallel scanning path

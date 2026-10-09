@@ -93,7 +93,7 @@ padding bytes. `ratdmp` gives applications a predictable core:
 
 ```toml
 [dependencies]
-ratdmp = "0.9.1"
+ratdmp = "0.9.2"
 ```
 
 Or:
@@ -328,11 +328,5 @@ Rust 1.70.
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
-  <http://www.apache.org/licenses/LICENSE-2.0>)
-- GNU Affero General Public License v3.0 ([LICENSE](LICENSE) or 
-  <https://gnu.org>)
-  
-at your option.
+Licensed under the GNU General Public License v3.0 only. See
+[LICENSE](LICENSE) for the full license text.

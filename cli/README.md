@@ -16,7 +16,7 @@ Professional command-line frontend for the
 ## Install
 
 ```bash
-cargo install ratdmp-cli --version 1.0.1
+cargo install ratdmp-cli --version 1.0.2
 ```
 
 This downloads the core library, builds an optimized `ratdmp` executable, and
