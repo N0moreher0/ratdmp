@@ -35,8 +35,19 @@ CLI when you want an immediate command-line workflow.
 
 ## Install the CLI and use it
 
-Install once; Cargo downloads the CLI and core library, builds an optimized
-`ratdmp` executable, and places it on your Cargo binary path:
+For the fastest setup, download a prebuilt binary from the
+[latest automated GitHub Release](https://github.com/N0moreher0/ratdmp/releases)
+and put `ratdmp` on your `PATH`. Every push to `main` publishes platform
+archives for Windows, Linux, and macOS.
+
+If you use [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall),
+it downloads the matching release binary instead of compiling from source:
+
+```powershell
+cargo binstall ratdmp-cli
+```
+
+The normal Cargo command remains available, but it compiles locally:
 
 ```powershell
 cargo install ratdmp-cli

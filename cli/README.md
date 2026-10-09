@@ -16,11 +16,18 @@ Professional command-line frontend for the
 ## Install
 
 ```bash
-cargo install ratdmp-cli --version 1.0.3
+cargo binstall ratdmp-cli
 ```
 
-This downloads the core library, builds an optimized `ratdmp` executable, and
-installs it on your Cargo binary path.
+This downloads a prebuilt binary from the GitHub Releases page and installs it
+without compiling Rust code. Automated releases are created for every push to
+the `main` branch.
+
+If `cargo-binstall` is not installed, use the normal source-build fallback:
+
+```bash
+cargo install ratdmp-cli
+```
 
 ## Use
 
