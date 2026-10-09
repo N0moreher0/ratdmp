@@ -1,6 +1,6 @@
 [package]
 name = "ratdmp-cli"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "Command-line frontend for the ratdmp memory-dump string extraction library"
@@ -9,6 +9,10 @@ repository = "https://github.com/N0moreher0/ratdmp"
 keywords = ["strings", "forensics", "memory-dump", "malware", "dfir"]
 categories = ["command-line-utilities"]
 rust-version = "1.70"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
 
 [dependencies]
 ratdmp = { version = "0.9.4", path = ".." }

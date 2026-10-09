@@ -95,8 +95,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="build-${GITHUB_SHA::12}"
-          gh release create "$tag" dist/* \
-            --target "$GITHUB_SHA" \
-            --title "Automated build ${GITHUB_SHA::12}" \
-            --notes "Prebuilt ratdmp-cli binaries for commit ${GITHUB_SHA}."
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' cli/Cargo.toml | head -n 1)"
+          tag="v${version}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "ratdmp-cli ${version}" \
+              --notes "Prebuilt ratdmp-cli binaries for commit ${GITHUB_SHA}."
+          fi
