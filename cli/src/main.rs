@@ -4,10 +4,11 @@ use ratdmp::{
     scan_entropy_from_file_streaming_with_data, scan_yara_from_file_streaming, EntropyRegion,
     ExtractedString, NoiseConfig, MAX_STRINGS, MIN_STRING_LEN,
 };
+use regex::Regex;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, IsTerminal, Read, Write};
 use std::time::Instant;
-use regex::Regex;
+use std::sync::OnceLock;
 
 const ENTROPY_THRESHOLD: f64 = 7.2;
 const MAX_ENTROPY_REPORTS: usize = 12;
@@ -39,6 +40,16 @@ struct Args {
     parse_pid: bool,
     stats: bool,
     filter_regex: Option<String>,
+    detector: Option<Detector>,
+    magic_bytes: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Detector {
+    Ip,
+    Url,
+    Domain,
+    Base64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -77,7 +88,12 @@ OPTIONS:
     --brute-xor <1b;2b;3b>
                           Brute-force XOR candidates using selected key sizes
     --parse-pid          Map PID markers in extracted strings
-    --filter-regex <RE>  Keep strings matching a regular expression
+    --detect-ip           Output only IPv4/IPv6 strings
+    --detect-url          Output only HTTP/HTTPS URLs
+    --detect-domain       Output only domain names
+    --detect-b64          Decode and output Base64 strings
+    --magic-bytes         Report executable/document magic-byte signatures
+    --filter-regex <RE>   Legacy generic regex filter
     --stats              Always-on report compatibility flag
     -h, --help           Show this help
 ";
@@ -105,6 +121,8 @@ fn parse_args() -> Result<Args, String> {
         parse_pid: false,
         stats: false,
         filter_regex: None,
+        detector: None,
+        magic_bytes: false,
     };
     let mut i = 0;
     while i < values.len() {
@@ -185,7 +203,20 @@ fn parse_args() -> Result<Args, String> {
             "--parse-pid" => args.parse_pid = true,
             "--stats" => args.stats = true,
             "--filter-regex" => args.filter_regex = Some(next(&mut i)?),
+            "--detect-ip" => set_detector(&mut args.detector, Detector::Ip)?,
+            "--detect-url" => set_detector(&mut args.detector, Detector::Url)?,
+            "--detect-domain" => set_detector(&mut args.detector, Detector::Domain)?,
+            "--detect-b64" => set_detector(&mut args.detector, Detector::Base64)?,
+            "--magic-bytes" => args.magic_bytes = true,
             other => return Err(format!("unknown option '{other}'")),
+        }
+
+        fn set_detector(current: &mut Option<Detector>, detector: Detector) -> Result<(), String> {
+            if current.is_some() {
+                return Err("detector options are mutually exclusive".to_string());
+            }
+            *current = Some(detector);
+            Ok(())
         }
         i += 1;
     }
@@ -221,6 +252,167 @@ fn hex_encode(data: &[u8]) -> String {
 
 fn matches_filter(regex: Option<&Regex>, text: &str) -> bool {
     regex.map_or(true, |regex| regex.is_match(text))
+}
+
+fn detected_ip_value(text: &str) -> Option<String> {
+    static IPV4: OnceLock<Regex> = OnceLock::new();
+    let ipv4 = IPV4.get_or_init(|| {
+        Regex::new(
+            r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b",
+        )
+        .unwrap()
+    });
+    if let Some(value) = ipv4
+        .find_iter(text)
+        .find(|matched| is_public_ipv4(matched.as_str()))
+    {
+        return Some(value.as_str().to_string());
+    }
+    text.split(|character: char| character.is_whitespace() || "\"'<>(),;[]{}".contains(character))
+        .find(|token| token.parse::<std::net::Ipv6Addr>().is_ok())
+        .map(str::to_string)
+}
+
+fn detected_url_value(text: &str) -> Option<String> {
+    static URL: OnceLock<Regex> = OnceLock::new();
+    URL.get_or_init(|| Regex::new(r#"(?i)\bhttps?://[^\s"'<>]+"#).unwrap())
+        .find(text)
+        .map(|matched| matched.as_str().trim_end_matches(['.', ',', ';', ')', ']', '}']).to_string())
+}
+
+fn detected_domain_value(text: &str) -> Option<String> {
+    static DOMAIN: OnceLock<Regex> = OnceLock::new();
+    DOMAIN
+        .get_or_init(|| {
+            Regex::new(
+                r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}\b",
+            )
+            .unwrap()
+        })
+        .find(text)
+        .map(|matched| matched.as_str().to_string())
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn decode_base64(value: &str) -> Option<Vec<u8>> {
+    if value.len() < 16 || value.len() % 4 != 0 {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(value.len() * 3 / 4);
+    for chunk in bytes.chunks_exact(4) {
+        let a = base64_value(chunk[0])?;
+        let b = base64_value(chunk[1])?;
+        let c = if chunk[2] == b'=' { 0 } else { base64_value(chunk[2])? };
+        let d = if chunk[3] == b'=' { 0 } else { base64_value(chunk[3])? };
+        output.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            output.push((b << 4) | (c >> 2));
+        }
+        if chunk[3] != b'=' {
+            output.push((c << 6) | d);
+        }
+    }
+    Some(output)
+}
+
+fn detect_and_decode_base64(text: &str) -> Option<String> {
+    static B64: OnceLock<Regex> = OnceLock::new();
+    let regex = B64.get_or_init(|| {
+        Regex::new(r"(?:[A-Za-z0-9+/]{4}){4,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
+            .unwrap()
+    });
+    regex.find_iter(text).find_map(|matched| {
+        let decoded = decode_base64(matched.as_str())?;
+        let decoded = String::from_utf8(decoded).ok()?;
+        if decoded.chars().any(|character| character.is_ascii_alphanumeric()) {
+            Some(decoded)
+        } else {
+            None
+        }
+    })
+}
+
+fn apply_detector(mut result: ExtractedString, detector: Option<Detector>) -> Option<ExtractedString> {
+    match detector {
+        None => Some(result),
+        Some(Detector::Ip) => {
+            result.text = detected_ip_value(&result.text)?;
+            Some(result)
+        }
+        Some(Detector::Url) => {
+            result.text = detected_url_value(&result.text)?;
+            Some(result)
+        }
+        Some(Detector::Domain) => {
+            result.text = detected_domain_value(&result.text)?;
+            Some(result)
+        }
+        Some(Detector::Base64) => {
+            result.text = detect_and_decode_base64(&result.text)?;
+            Some(result)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MagicMatch {
+    offset: u64,
+    kind: &'static str,
+}
+
+fn scan_magic_bytes(path: &str) -> io::Result<Vec<MagicMatch>> {
+    let mut reader = BufReader::with_capacity(1 << 16, File::open(path)?);
+    let signatures: &[(&[u8], &str)] = &[
+        (b"MZ", "PE/DOS executable"),
+        (b"\x7fELF", "ELF executable"),
+        (b"PK\x03\x04", "ZIP/Office archive"),
+        (b"%PDF-", "PDF document"),
+        (b"\x89PNG\r\n\x1a\n", "PNG image"),
+    ];
+    let mut matches = Vec::new();
+    let mut buffer = Vec::with_capacity((1 << 16) + 16);
+    let mut chunk = vec![0u8; 1 << 16];
+    let mut offset = 0u64;
+    loop {
+        let previous = buffer.len().min(16);
+        if buffer.len() > previous {
+            buffer.drain(..buffer.len() - previous);
+        }
+        let start = offset.saturating_sub(previous as u64);
+        let read = reader.read(&mut chunk)?;
+        buffer.extend_from_slice(&chunk[..read]);
+        for (signature, kind) in signatures {
+            for (index, window) in buffer.windows(signature.len()).enumerate() {
+                if index + signature.len() > previous && window == *signature {
+                    matches.push(MagicMatch {
+                        offset: start + index as u64,
+                        kind,
+                    });
+                    if matches.len() >= 256 {
+                        matches.sort_by_key(|item| item.offset);
+                        return Ok(matches);
+                    }
+                }
+            }
+        }
+        offset += read as u64;
+        if read == 0 {
+            break;
+        }
+    }
+    matches.sort_by_key(|item| item.offset);
+    Ok(matches)
 }
 
 fn write_entropy_json(
@@ -289,12 +481,128 @@ fn write_yara_json(
     Ok(())
 }
 
+fn write_magic_text(magic: &MagicMatch, writer: &mut dyn Write) -> io::Result<()> {
+    writeln!(writer, "{:#010x}\tMAGIC\t{}", magic.offset, magic.kind)
+}
+
+fn write_magic_json(
+    magic: &MagicMatch,
+    writer: &mut dyn Write,
+    result_count: &mut usize,
+) -> io::Result<()> {
+    if *result_count > 0 {
+        write!(writer, ",\n")?;
+    }
+    write!(
+        writer,
+        "  {{\"group\":\"MAGIC\",\"offset\":{},\"kind\":{}}}",
+        magic.offset,
+        json_escape(magic.kind)
+    )?;
+    *result_count += 1;
+    Ok(())
+}
+
 #[derive(Clone)]
 struct XorResult {
     offset: u64,
     key: Vec<u8>,
     plaintext: Vec<u8>,
     score: f64,
+}
+
+fn refang_ioc_text(text: &str) -> String {
+        static BRACKET_DOT: OnceLock<Regex> = OnceLock::new();
+        static BRACKET_AT: OnceLock<Regex> = OnceLock::new();
+        static WORD_DOT: OnceLock<Regex> = OnceLock::new();
+        static WORD_AT: OnceLock<Regex> = OnceLock::new();
+        let text = BRACKET_DOT
+            .get_or_init(|| Regex::new(r"\s*[\[\(]\s*\.\s*[\]\)]\s*").unwrap())
+            .replace_all(text, ".");
+        let text = BRACKET_AT
+            .get_or_init(|| Regex::new(r"(?i)\s*[\[\(]\s*at\s*[\]\)]\s*").unwrap())
+            .replace_all(&text, "@");
+        let text = WORD_DOT
+            .get_or_init(|| Regex::new(r"(?i)\s+dot\s+").unwrap())
+            .replace_all(&text, ".");
+        WORD_AT
+            .get_or_init(|| Regex::new(r"(?i)\s+at\s+").unwrap())
+            .replace_all(&text, "@")
+            .into_owned()
+}
+
+fn is_public_ipv4(value: &str) -> bool {
+        let ip = value.split(':').next().unwrap_or(value);
+        let Ok(address) = ip.parse::<std::net::Ipv4Addr>() else {
+            return false;
+        };
+        let octets = address.octets();
+        let is_shared = octets[0] == 100 && (64..=127).contains(&octets[1]);
+        let is_benchmark = octets[0] == 198 && (18..=19).contains(&octets[1]);
+        let is_documentation = (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+            || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+            || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113);
+        !address.is_private()
+            && !address.is_loopback()
+            && !address.is_link_local()
+            && !address.is_unspecified()
+            && !address.is_multicast()
+            && !address.is_broadcast()
+            && !is_shared
+            && !is_benchmark
+            && !is_documentation
+}
+
+fn contains_public_ip(text: &str) -> bool {
+        static IPV4: OnceLock<Regex> = OnceLock::new();
+        let regex = IPV4.get_or_init(|| {
+            Regex::new(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?::\d{1,5})?\b")
+                .unwrap()
+        });
+        regex
+            .find_iter(text)
+            .any(|matched| is_public_ipv4(matched.as_str()))
+}
+
+fn shannon_entropy(text: &str) -> f64 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let mut counts = [0usize; 256];
+        for byte in text.bytes() {
+            counts[byte as usize] += 1;
+        }
+        let length = text.len() as f64;
+        counts
+            .iter()
+            .filter(|&&count| count != 0)
+            .map(|&count| {
+                let probability = count as f64 / length;
+                -probability * probability.log2()
+            })
+            .sum()
+}
+
+fn contains_meaningful_base64(text: &str) -> bool {
+        static BASE64: OnceLock<Regex> = OnceLock::new();
+        let regex = BASE64.get_or_init(|| {
+            Regex::new(r"(?:[A-Za-z0-9+/]{4}){10,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
+                .unwrap()
+        });
+        let bytes = text.as_bytes();
+        regex.find_iter(text).any(|matched| {
+            let before_ok = matched.start() == 0
+                || !bytes[matched.start() - 1].is_ascii_alphanumeric()
+                    && !matches!(bytes[matched.start() - 1], b'+' | b'/' | b'=');
+            let after_ok = matched.end() == bytes.len()
+                || !bytes[matched.end()].is_ascii_alphanumeric()
+                    && !matches!(bytes[matched.end()], b'+' | b'/' | b'=');
+            let value = matched.as_str();
+            before_ok
+                && after_ok
+                && shannon_entropy(value) >= 1.0
+                && value.bytes().any(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn xor_printable_score(data: &[u8]) -> f64 {
@@ -309,8 +617,10 @@ fn xor_printable_score(data: &[u8]) -> f64 {
         .iter()
         .filter(|&&byte| byte.is_ascii_alphanumeric())
         .count();
+    let question_marks = data.iter().filter(|&&byte| byte == b'?').count();
     if alphanumeric < MIN_XOR_ALNUM_CHARS
         || (alphanumeric as f64 / data.len() as f64) < 0.2
+        || (question_marks as f64 / data.len() as f64) > 0.1
     {
         return 0.0;
     }
@@ -491,15 +801,11 @@ fn parse_pid_marker(text: &str) -> Option<u32> {
 }
 
 fn important_reason(text: &str) -> Option<&'static str> {
-    let lower = text.to_ascii_lowercase();
-    if [
-        "password", "passwd", "token", "secret", "apikey", "api_key", "jwt",
-    ]
-    .iter()
-    .any(|term| lower.contains(term))
-    {
+    let refanged = refang_ioc_text(text);
+    let lower = refanged.to_ascii_lowercase();
+    if contains_credential_marker(&lower) {
         Some("credential")
-    } else if contains_ip_address(text) {
+    } else if contains_public_ip(&refanged) {
         Some("ip-address")
     } else if contains_crypto_address(text) {
         Some("crypto-wallet")
@@ -507,24 +813,34 @@ fn important_reason(text: &str) -> Option<&'static str> {
         Some("url")
     } else if lower.contains("c2") || lower.contains("gate.php") {
         Some("network")
-    } else if lower.contains('@') {
+    } else if lower.contains('@') && lower.contains('.') {
         Some("email")
+    } else if contains_meaningful_base64(&refanged) {
+        Some("base64")
+    } else if lower.contains("\\temp\\")
+        || lower.contains("\\appdata\\")
+        || lower.contains("\\startup\\")
+        || lower.contains("\\public\\")
+    {
+        Some("suspicious-path")
     } else {
         None
     }
 }
 
-fn contains_ip_address(text: &str) -> bool {
-    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != ':')
+fn contains_credential_marker(text: &str) -> bool {
+    let tokens: Vec<&str> = text
+        .split(|character: char| !character.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
-        .any(|token| {
-            token
-                .split_once(':')
-                .map(|(host, _port)| host.parse::<std::net::Ipv4Addr>().is_ok())
-                .unwrap_or(false)
-                || token.parse::<std::net::Ipv4Addr>().is_ok()
-                || token.parse::<std::net::Ipv6Addr>().is_ok()
-        })
+        .collect();
+    let markers = ["password", "passwd", "token", "secret", "apikey", "jwt"];
+    tokens.iter().enumerate().any(|(index, token)| {
+        markers.contains(token)
+            && (tokens
+                .get(index.saturating_sub(1))
+                .is_some_and(|neighbor| *neighbor != *token)
+                || tokens.get(index + 1).is_some())
+    })
 }
 
 fn contains_crypto_address(text: &str) -> bool {
@@ -583,16 +899,20 @@ fn is_crypto_address(token: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::{
-        contains_crypto_address, contains_ip_address, important_reason, matches_filter,
-        parse_pid_marker, xor_printable_score,
+        contains_crypto_address, contains_meaningful_base64, detected_domain_value,
+        detected_ip_value, detected_url_value, important_reason, matches_filter,
+        parse_pid_marker, refang_ioc_text, scan_magic_bytes, xor_printable_score,
+        ExtractedString,
     };
     use regex::Regex;
 
     #[test]
     fn highlights_ipv4_and_ipv6() {
-        assert!(contains_ip_address("connect 192.168.56.101:4444"));
-        assert!(contains_ip_address("fe80::1"));
+        assert!(!super::contains_public_ip("connect 192.168.56.101:4444"));
+        assert!(!super::contains_public_ip("fe80::1"));
     }
 
     #[test]
@@ -607,7 +927,7 @@ mod tests {
 
     #[test]
     fn prioritizes_ip_and_wallet_signals() {
-        assert_eq!(important_reason("server=10.0.0.8"), Some("ip-address"));
+        assert_eq!(important_reason("server=8.8.8.8"), Some("ip-address"));
         assert_eq!(
             important_reason("wallet=0x52908400098527886E0F7030069857D2E4169EE7"),
             Some("crypto-wallet")
@@ -632,7 +952,72 @@ mod tests {
     #[test]
     fn rejects_xor_plaintext_without_alphanumeric_content() {
         assert_eq!(xor_printable_score(b"????????????????"), 0.0);
+        assert_eq!(xor_printable_score(b"abc????????????"), 0.0);
         assert!(xor_printable_score(b"password=secret") > 0.0);
+    }
+
+    #[test]
+    fn refangs_common_ioc_obfuscation() {
+        assert_eq!(refang_ioc_text("https://example[.]com user [at] example[.]com"), "https://example.com user@example.com");
+    }
+
+    #[test]
+    fn ignores_private_ip_and_low_entropy_base64_noise() {
+        assert_ne!(important_reason("connect 192.168.1.10"), Some("ip-address"));
+        assert_ne!(important_reason("docs 203.0.113.10"), Some("ip-address"));
+        assert_eq!(important_reason("publicKeyToken=abc"), None);
+        assert_eq!(important_reason("token=abc"), Some("credential"));
+        assert!(contains_meaningful_base64(
+            "VGhpcyBpcyBhIHJlYWwgYmFzZTY0IHBheWxvYWQxMjM="
+        ));
+        assert!(!contains_meaningful_base64(&"A".repeat(48)));
+    }
+
+    #[test]
+    fn detectors_return_only_the_detected_value() {
+        assert_eq!(
+            detected_ip_value("connect to 8.8.8.8:443 now").as_deref(),
+            Some("8.8.8.8")
+        );
+        assert_eq!(
+            detected_url_value("C2=https://example.com/api?q=1;").as_deref(),
+            Some("https://example.com/api?q=1")
+        );
+        assert_eq!(
+            detected_domain_value("prefix example.org suffix").as_deref(),
+            Some("example.org")
+        );
+        let result = ExtractedString {
+            offset: 4,
+            encoding: "ascii",
+            text: "prefix example.org suffix".to_string(),
+        };
+        assert_eq!(
+            super::apply_detector(result, Some(super::Detector::Domain))
+                .unwrap()
+                .text,
+            "example.org"
+        );
+    }
+
+    #[test]
+    fn magic_scan_handles_chunk_boundaries_without_duplicates() {
+        let path = std::env::temp_dir().join(format!(
+            "ratdmp-magic-test-{}.dmp",
+            std::process::id()
+        ));
+        let mut data = vec![b'x'; 65_535];
+        data.extend_from_slice(b"MZ");
+        data.extend_from_slice(&[b'y'; 65_535]);
+        data.extend_from_slice(b"%PDF-");
+        fs::write(&path, data).unwrap();
+
+        let matches = scan_magic_bytes(path.to_str().unwrap()).unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].offset, 65_535);
+        assert_eq!(matches[0].kind, "PE/DOS executable");
+        assert_eq!(matches[1].kind, "PDF document");
     }
 }
 
@@ -684,6 +1069,13 @@ fn print_selected_options(args: &Args, threads: usize) {
     let auto_tune = if args.auto_tune { "on" } else { "off" };
     let parse_pid = if args.parse_pid { "on" } else { "off" };
     let entropy = if args.entropy { "on" } else { "off" };
+    let detector = match args.detector {
+        Some(Detector::Ip) => "ip",
+        Some(Detector::Url) => "url",
+        Some(Detector::Domain) => "domain",
+        Some(Detector::Base64) => "b64",
+        None => "off",
+    };
 
     if io::stderr().is_terminal() {
         eprintln!("\x1b[1;36m  selected options\x1b[0m");
@@ -698,8 +1090,10 @@ fn print_selected_options(args: &Args, threads: usize) {
         "    threads={threads} auto-tune={auto_tune} noise-threshold={noise}"
     );
     eprintln!(
-        "    entropy={entropy} yara={} brute-xor={} parse-pid={parse_pid}",
-        yara, brute_xor
+        "    entropy={entropy} yara={} brute-xor={} parse-pid={parse_pid} detector={detector} magic-bytes={}",
+        yara,
+        brute_xor,
+        if args.magic_bytes { "on" } else { "off" }
     );
     eprintln!(
         "    filter-regex={}",
@@ -844,6 +1238,9 @@ fn main() -> Result<(), String> {
         .map(Regex::new)
         .transpose()
         .map_err(|error| format!("invalid --filter-regex: {error}"))?;
+    if args.detector.is_some() && filter_regex.is_some() {
+        return Err("--filter-regex cannot be combined with a detector".to_string());
+    }
     let file_size = std::fs::metadata(&args.path)
         .map_err(|e| format!("cannot inspect '{}': {e}", args.path))?
         .len();
@@ -865,6 +1262,11 @@ fn main() -> Result<(), String> {
         .map(NoiseConfig::from_threshold)
         .unwrap_or_default();
     print_selected_options(&args, threads);
+    let magic_matches = if args.magic_bytes {
+        scan_magic_bytes(&args.path).map_err(|error| format!("magic-byte scan failed: {error}"))?
+    } else {
+        Vec::new()
+    };
     let start = Instant::now();
     let mut entropy_regions = Vec::new();
     if args.entropy {
@@ -936,6 +1338,7 @@ fn main() -> Result<(), String> {
                     || (args.encoding == Encoding::Ascii && result.encoding == "ascii")
                     || (args.encoding == Encoding::Utf16 && result.encoding == "utf16le")
                 {
+                    if let Some(result) = apply_detector(result, args.detector) {
                     if matches_filter(filter_regex.as_ref(), &result.text) {
                         if let Err(error) = record_result(
                             result,
@@ -949,6 +1352,7 @@ fn main() -> Result<(), String> {
                             args.parse_pid,
                         ) {
                             write_error = Some(error);
+                        }
                         }
                     }
                 }
@@ -970,6 +1374,10 @@ fn main() -> Result<(), String> {
                     .map_or(true, |regex| regex.is_match(&String::from_utf8_lossy(&result.plaintext)))
                 {
                     write_xor_json(result, &mut writer, &mut json_count)
+                        .map_err(|e| format!("write failed: {e}"))?;
+                }
+                for magic in &magic_matches {
+                    write_magic_json(magic, &mut writer, &mut json_count)
                         .map_err(|e| format!("write failed: {e}"))?;
                 }
             }
@@ -1004,6 +1412,10 @@ fn main() -> Result<(), String> {
                     .map_or(true, |regex| regex.is_match(&String::from_utf8_lossy(&result.plaintext)))
                 {
                     write_xor_text(result, &mut writer)
+                        .map_err(|e| format!("write failed: {e}"))?;
+                }
+                for magic in &magic_matches {
+                    write_magic_text(magic, &mut writer)
                         .map_err(|e| format!("write failed: {e}"))?;
                 }
             }
@@ -1060,6 +1472,7 @@ fn main() -> Result<(), String> {
             Encoding::Ascii => result.encoding == "ascii",
             Encoding::Utf16 => result.encoding == "utf16le",
         })
+        .filter_map(|result| apply_detector(result, args.detector))
         .filter(|result| {
             filter_regex
                 .as_ref()
@@ -1091,6 +1504,10 @@ fn main() -> Result<(), String> {
                 .map_or(true, |regex| regex.is_match(&String::from_utf8_lossy(&result.plaintext)))
             {
                 write_xor_json(result, &mut writer, &mut json_count)
+                    .map_err(|e| format!("write failed: {e}"))?;
+            }
+            for magic in &magic_matches {
+                write_magic_json(magic, &mut writer, &mut json_count)
                     .map_err(|e| format!("write failed: {e}"))?;
             }
         }
@@ -1128,6 +1545,10 @@ fn main() -> Result<(), String> {
                 .map_or(true, |regex| regex.is_match(&String::from_utf8_lossy(&result.plaintext)))
             {
                 write_xor_text(result, &mut writer)
+                    .map_err(|e| format!("write failed: {e}"))?;
+            }
+            for magic in &magic_matches {
+                write_magic_text(magic, &mut writer)
                     .map_err(|e| format!("write failed: {e}"))?;
             }
         }

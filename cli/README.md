@@ -33,6 +33,8 @@ ratdmp memory.dmp --noise-threshold 16 --threads 4
 ratdmp memory.dmp --yar rules.yar --format json -o triage.json
 ratdmp memory.dmp --brute-xor "1b;2b" --format json -o xor.json
 ratdmp memory.dmp --filter-regex "(?i)(password|token|secret)"
+ratdmp memory.dmp --detect-url
+ratdmp memory.dmp --detect-b64 --magic-bytes
 ```
 
 ## Features
@@ -42,6 +44,14 @@ ratdmp memory.dmp --filter-regex "(?i)(password|token|secret)"
 - Configurable minimum length and result limits.
 - `--filter-regex <RE>` keeps extracted strings and XOR plaintext matching a
   Rust regular expression; invalid expressions fail with an explicit error.
+- `--detect-ip` emits only detected public IPv4/IPv6 values.
+- `--detect-url` emits only HTTP/HTTPS URLs, with trailing punctuation removed.
+- `--detect-domain` emits only domain names, without surrounding extracted text.
+- `--detect-b64` finds Base64 runs and emits decoded printable UTF-8 text.
+- Detector modes are mutually exclusive and cannot be combined with
+  `--filter-regex`; without one, the default full extraction is unchanged.
+- `--magic-bytes` reports executable/document signatures such as PE (`MZ`), ELF,
+  ZIP/Office, PDF, and PNG while scanning large files in bounded chunks.
 - Conservative repeat-noise filtering.
 - Parallel scanning with explicit threads or `--auto-tune`.
 - Before scanning, the CLI prints the effective selected options to `stderr`
@@ -68,6 +78,8 @@ ratdmp memory.dmp --filter-regex "(?i)(password|token|secret)"
 - `--parse-pid` adds a `pid` field to JSON or a `pid=...` column to text output
   when a string contains a `PID=`/`ProcessId=` marker.
 - Automatic scan summary and priority triage signals on `stderr`.
+- IOC triage refangs `[.]`/`[at]` notation, validates public IPv4 addresses,
+  filters private/reserved IP noise, and ignores low-entropy Base64-like runs.
 - IPv4/IPv6 and common crypto-wallet address triage signals.
 - Clean stdout for shell pipelines and automation.
 

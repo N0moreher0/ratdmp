@@ -226,6 +226,13 @@ The CLI adds:
   printable/UTF-8 scored XOR brute-forcing in the CLI only
 - `--filter-regex <RE>` to keep extracted strings and XOR plaintext matching a
   Rust regular expression
+- `--detect-ip`, `--detect-url`, `--detect-domain`, and `--detect-b64` to emit
+  only the selected IOC type; Base64 mode decodes printable UTF-8 payloads
+- `--magic-bytes` to report bounded executable/document signatures such as PE
+  (`MZ`), ELF, ZIP/Office, PDF, and PNG
+- IOC triage refangs common `[.]`/`[at]` obfuscation, validates public IPv4
+  addresses, filters private IP noise, and uses entropy to reject Base64-like
+  filler
 - `--parse-pid` to map common PID markers in extracted strings
 - `-o/--output`
 - automatic scan reports and priority triage signals on `stderr`
@@ -235,6 +242,10 @@ Results stay clean on `stdout`, so the CLI works both interactively and in
 shell pipelines. The priority signals are practical investigation hints for
 common credential, token, secret, URL, network, and email patterns; they are
 not a verdict that a value is valid, active, or malicious.
+
+Detector modes are mutually exclusive and intentionally replace the normal
+string value with the detected token. They cannot be combined with
+`--filter-regex`; omit all detector flags for the default full extraction.
 
 Entropy scanning is opt-in so the default scan keeps its original throughput.
 When enabled, fixed-size high-entropy regions are exported as `Undefined`
