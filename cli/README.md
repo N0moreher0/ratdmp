@@ -16,7 +16,7 @@ Professional command-line frontend for the
 ## Install
 
 ```bash
-cargo install ratdmp-cli --version 1.0.2
+cargo install ratdmp-cli --version 1.0.3
 ```
 
 This downloads the core library, builds an optimized `ratdmp` executable, and
@@ -32,6 +32,7 @@ ratdmp memory.dmp --encoding utf16 --min-len 6
 ratdmp memory.dmp --noise-threshold 16 --threads 4
 ratdmp memory.dmp --yar rules.yar --format json -o triage.json
 ratdmp memory.dmp --brute-xor "1b;2b" --format json -o xor.json
+ratdmp memory.dmp --filter-regex "(?i)(password|token|secret)"
 ```
 
 ## Features
@@ -39,6 +40,8 @@ ratdmp memory.dmp --brute-xor "1b;2b" --format json -o xor.json
 - ASCII and UTF-16LE extraction.
 - Streaming scans for large dump files.
 - Configurable minimum length and result limits.
+- `--filter-regex <RE>` keeps extracted strings and XOR plaintext matching a
+  Rust regular expression; invalid expressions fail with an explicit error.
 - Conservative repeat-noise filtering.
 - Parallel scanning with explicit threads or `--auto-tune`.
 - Before scanning, the CLI prints the effective selected options to `stderr`

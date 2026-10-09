@@ -7,6 +7,7 @@ use ratdmp::{
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, IsTerminal, Read, Write};
 use std::time::Instant;
+use regex::Regex;
 
 const ENTROPY_THRESHOLD: f64 = 7.2;
 const MAX_ENTROPY_REPORTS: usize = 12;
@@ -14,6 +15,7 @@ const MAX_XOR_CANDIDATES: usize = 256;
 const MAX_XOR_CANDIDATE_LEN: usize = 100;
 const MIN_XOR_CANDIDATE_LEN: usize = 10;
 const MAX_XOR_RESULTS_PER_CANDIDATE: usize = 5;
+const MIN_XOR_ALNUM_CHARS: usize = 3;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Format {
@@ -36,6 +38,7 @@ struct Args {
     brute_xor: Option<Vec<usize>>,
     parse_pid: bool,
     stats: bool,
+    filter_regex: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -74,6 +77,7 @@ OPTIONS:
     --brute-xor <1b;2b;3b>
                           Brute-force XOR candidates using selected key sizes
     --parse-pid          Map PID markers in extracted strings
+    --filter-regex <RE>  Keep strings matching a regular expression
     --stats              Always-on report compatibility flag
     -h, --help           Show this help
 ";
@@ -100,6 +104,7 @@ fn parse_args() -> Result<Args, String> {
         brute_xor: None,
         parse_pid: false,
         stats: false,
+        filter_regex: None,
     };
     let mut i = 0;
     while i < values.len() {
@@ -179,6 +184,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--parse-pid" => args.parse_pid = true,
             "--stats" => args.stats = true,
+            "--filter-regex" => args.filter_regex = Some(next(&mut i)?),
             other => return Err(format!("unknown option '{other}'")),
         }
         i += 1;
@@ -211,6 +217,10 @@ fn hex_encode(data: &[u8]) -> String {
         encoded.push_str(&format!("{byte:02x}"));
     }
     encoded
+}
+
+fn matches_filter(regex: Option<&Regex>, text: &str) -> bool {
+    regex.map_or(true, |regex| regex.is_match(text))
 }
 
 fn write_entropy_json(
@@ -295,6 +305,15 @@ fn xor_printable_score(data: &[u8]) -> f64 {
         .iter()
         .filter(|&&byte| (32..=126).contains(&byte) || byte == b'\t' || byte == b'\n' || byte == b'\r')
         .count();
+    let alphanumeric = data
+        .iter()
+        .filter(|&&byte| byte.is_ascii_alphanumeric())
+        .count();
+    if alphanumeric < MIN_XOR_ALNUM_CHARS
+        || (alphanumeric as f64 / data.len() as f64) < 0.2
+    {
+        return 0.0;
+    }
     let text = String::from_utf8_lossy(data).to_ascii_lowercase();
     let mut score = printable as f64 / data.len() as f64;
     if std::str::from_utf8(data).is_ok() {
@@ -327,6 +346,9 @@ fn xor_top_results(candidate: &[u8], offset: u64, key_size: usize) -> Vec<XorRes
             score: xor_printable_score(&plaintext),
             plaintext,
         };
+        if result.score == 0.0 {
+            continue;
+        }
         let position = top
             .iter()
             .position(|item: &XorResult| result.score > item.score)
@@ -561,7 +583,11 @@ fn is_crypto_address(token: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_crypto_address, contains_ip_address, important_reason, parse_pid_marker};
+    use super::{
+        contains_crypto_address, contains_ip_address, important_reason, matches_filter,
+        parse_pid_marker, xor_printable_score,
+    };
+    use regex::Regex;
 
     #[test]
     fn highlights_ipv4_and_ipv6() {
@@ -593,6 +619,20 @@ mod tests {
         assert_eq!(parse_pid_marker("ProcessId=4242 image.exe"), Some(4242));
         assert_eq!(parse_pid_marker("pid: 1337"), Some(1337));
         assert_eq!(parse_pid_marker("no process marker"), None);
+    }
+
+    #[test]
+    fn filters_strings_with_regex() {
+        let regex = Regex::new("(?i)(password|token)").unwrap();
+        assert!(matches_filter(Some(&regex), "access_token=abc"));
+        assert!(!matches_filter(Some(&regex), "ordinary filename"));
+        assert!(matches_filter(None, "anything"));
+    }
+
+    #[test]
+    fn rejects_xor_plaintext_without_alphanumeric_content() {
+        assert_eq!(xor_printable_score(b"????????????????"), 0.0);
+        assert!(xor_printable_score(b"password=secret") > 0.0);
     }
 }
 
@@ -660,6 +700,10 @@ fn print_selected_options(args: &Args, threads: usize) {
     eprintln!(
         "    entropy={entropy} yara={} brute-xor={} parse-pid={parse_pid}",
         yara, brute_xor
+    );
+    eprintln!(
+        "    filter-regex={}",
+        args.filter_regex.as_deref().unwrap_or("off")
     );
     eprintln!("    output={output}");
 }
@@ -794,6 +838,12 @@ fn write_results(
 
 fn main() -> Result<(), String> {
     let args = parse_args()?;
+    let filter_regex = args
+        .filter_regex
+        .as_deref()
+        .map(Regex::new)
+        .transpose()
+        .map_err(|error| format!("invalid --filter-regex: {error}"))?;
     let file_size = std::fs::metadata(&args.path)
         .map_err(|e| format!("cannot inspect '{}': {e}", args.path))?
         .len();
@@ -886,18 +936,20 @@ fn main() -> Result<(), String> {
                     || (args.encoding == Encoding::Ascii && result.encoding == "ascii")
                     || (args.encoding == Encoding::Utf16 && result.encoding == "utf16le")
                 {
-                    if let Err(error) = record_result(
-                        result,
-                        &mut writer,
-                        args.format,
-                        &mut result_count,
-                        &mut short,
-                        &mut medium,
-                        &mut long,
-                        &mut important,
-                        args.parse_pid,
-                    ) {
-                        write_error = Some(error);
+                    if matches_filter(filter_regex.as_ref(), &result.text) {
+                        if let Err(error) = record_result(
+                            result,
+                            &mut writer,
+                            args.format,
+                            &mut result_count,
+                            &mut short,
+                            &mut medium,
+                            &mut long,
+                            &mut important,
+                            args.parse_pid,
+                        ) {
+                            write_error = Some(error);
+                        }
                     }
                 }
             },
@@ -913,8 +965,13 @@ fn main() -> Result<(), String> {
                     .map_err(|e| format!("write failed: {e}"))?;
             }
             for result in &xor_results {
-                write_xor_json(result, &mut writer, &mut json_count)
-                    .map_err(|e| format!("write failed: {e}"))?;
+                if filter_regex
+                    .as_ref()
+                    .map_or(true, |regex| regex.is_match(&String::from_utf8_lossy(&result.plaintext)))
+                {
+                    write_xor_json(result, &mut writer, &mut json_count)
+                        .map_err(|e| format!("write failed: {e}"))?;
+                }
             }
             if args.entropy {
                 scan_entropy_from_file_streaming_with_data(
@@ -942,8 +999,13 @@ fn main() -> Result<(), String> {
                     .map_err(|e| format!("write failed: {e}"))?;
             }
             for result in &xor_results {
-                write_xor_text(result, &mut writer)
-                    .map_err(|e| format!("write failed: {e}"))?;
+                if filter_regex
+                    .as_ref()
+                    .map_or(true, |regex| regex.is_match(&String::from_utf8_lossy(&result.plaintext)))
+                {
+                    write_xor_text(result, &mut writer)
+                        .map_err(|e| format!("write failed: {e}"))?;
+                }
             }
             if args.entropy {
             scan_entropy_from_file_streaming_with_data(
@@ -998,6 +1060,11 @@ fn main() -> Result<(), String> {
             Encoding::Ascii => result.encoding == "ascii",
             Encoding::Utf16 => result.encoding == "utf16le",
         })
+        .filter(|result| {
+            filter_regex
+                .as_ref()
+                .map_or(true, |regex| regex.is_match(&result.text))
+        })
         .collect();
 
     let output_path = args.output.clone();
@@ -1019,8 +1086,13 @@ fn main() -> Result<(), String> {
             .map_err(|e| format!("write failed: {e}"))?;
         }
         for result in &xor_results {
-            write_xor_json(result, &mut writer, &mut json_count)
-                .map_err(|e| format!("write failed: {e}"))?;
+            if filter_regex
+                .as_ref()
+                .map_or(true, |regex| regex.is_match(&String::from_utf8_lossy(&result.plaintext)))
+            {
+                write_xor_json(result, &mut writer, &mut json_count)
+                    .map_err(|e| format!("write failed: {e}"))?;
+            }
         }
         if args.entropy {
             let mut entropy_write_error = None;
@@ -1051,8 +1123,13 @@ fn main() -> Result<(), String> {
                 .map_err(|e| format!("write failed: {e}"))?;
         }
         for result in &xor_results {
-            write_xor_text(result, &mut writer)
-                .map_err(|e| format!("write failed: {e}"))?;
+            if filter_regex
+                .as_ref()
+                .map_or(true, |regex| regex.is_match(&String::from_utf8_lossy(&result.plaintext)))
+            {
+                write_xor_text(result, &mut writer)
+                    .map_err(|e| format!("write failed: {e}"))?;
+            }
         }
         if args.entropy && args.format == Format::Text {
             let mut entropy_write_error = None;

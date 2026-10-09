@@ -93,7 +93,7 @@ padding bytes. `ratdmp` gives applications a predictable core:
 
 ```toml
 [dependencies]
-ratdmp = "0.9.2"
+ratdmp = "0.9.3"
 ```
 
 Or:
@@ -224,6 +224,8 @@ The CLI adds:
   streaming scan (matched rules are emitted as `group: "YARA"` records)
 - `--brute-xor <1b;2b;3b>` to opt into bounded candidate collection and
   printable/UTF-8 scored XOR brute-forcing in the CLI only
+- `--filter-regex <RE>` to keep extracted strings and XOR plaintext matching a
+  Rust regular expression
 - `--parse-pid` to map common PID markers in extracted strings
 - `-o/--output`
 - automatic scan reports and priority triage signals on `stderr`

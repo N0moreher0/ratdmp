@@ -1,6 +1,6 @@
 [package]
 name = "ratdmp-cli"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "Command-line frontend for the ratdmp memory-dump string extraction library"
@@ -11,8 +11,9 @@ categories = ["command-line-utilities"]
 rust-version = "1.70"
 
 [dependencies]
-ratdmp = { version = "0.9.2", path = ".." }
+ratdmp = { version = "0.9.3", path = ".." }
 rayon = "1"
+regex = "1"
 
 [[bin]]
 name = "ratdmp"
